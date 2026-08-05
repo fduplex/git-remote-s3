@@ -2,11 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import datetime
+from io import BytesIO
+
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+from botocore.exceptions import ClientError
 
 from git_remote_s3 import UriScheme
-from git_remote_s3.manage import main
+from git_remote_s3.manage import main, Doctor
 
 
 @pytest.fixture
@@ -85,3 +89,198 @@ def test_doctor_accepts_options_before_and_after_uri(mocked_cli_chain, monkeypat
 
     assert excinfo.value.code == 0
     doctor_cls.assert_called_once_with("profile", "bucket", "repo", False, 30, True)
+
+
+NESTED_PREFIX = "vendors/extrahop"
+SHA1 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8a"
+SHA2 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8b"
+LFS_OID1 = "094ae93548989b4173f5ed4d2fe90480b8b4db8b14e818935644a5ee896db3b7"
+LFS_OID2 = "105b6d5b4ddc2b505c7fb8e405121aad67d440963b9dbd11eee2161403cf834d"
+
+
+def _make_doctor(prefix, delete_bundle=False):
+    with (
+        patch("boto3.Session"),
+        patch("git_remote_s3.manage.register_s3_access_grants"),
+        patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
+    ):
+        return Doctor(None, "bucket", prefix, delete_bundle)
+
+
+def _list_objects_mock(keys):
+    def side_effect(**kwargs):
+        return {
+            "Contents": [
+                {"Key": k, "LastModified": datetime.datetime.now(tz=datetime.timezone.utc)}
+                for k in keys
+                if k.startswith(kwargs["Prefix"])
+            ],
+        }
+
+    return side_effect
+
+
+def _repo_keys(prefix):
+    p = f"{prefix}/" if prefix else ""
+    return [
+        f"{p}HEAD",
+        f"{p}lfs/{LFS_OID1}",
+        f"{p}lfs/{LFS_OID2}",
+        f"{p}refs/heads/main/{SHA1}.bundle",
+        f"{p}refs/heads/main/{SHA2}.bundle",
+        f"{p}refs/heads/main/LOCK#.lock",
+        f"{p}refs/heads/feature/PROTECTED#",
+        f"{p}refs/heads/feature/{SHA1}.bundle",
+    ]
+
+
+@pytest.mark.parametrize("prefix", [NESTED_PREFIX, "test_prefix", ""])
+def test_analyze_repo_parses_keys_relative_to_prefix(prefix):
+    doctor = _make_doctor(prefix)
+    doctor.s3.list_objects_v2.side_effect = _list_objects_mock(_repo_keys(prefix))
+    doctor.s3.get_object.return_value = {"Body": BytesIO(b"refs/heads/main\n")}
+
+    repos = doctor.analyze_repo()
+
+    repo_name = prefix if prefix else "<bucket root>"
+    assert set(repos) == {repo_name}
+    refs = repos[repo_name]["refs"]
+    assert set(refs) == {"refs/heads/main", "refs/heads/feature"}
+    assert {b["sha"] for b in refs["refs/heads/main"]["bundles"]} == {SHA1, SHA2}
+    assert not refs["refs/heads/main"]["protected"]
+    assert refs["refs/heads/feature"]["protected"]
+    assert [b["sha"] for b in refs["refs/heads/feature"]["bundles"]] == [SHA1]
+    assert repos[repo_name]["HEAD"] == "refs/heads/main"
+    head_key = f"{prefix}/HEAD" if prefix else "HEAD"
+    doctor.s3.get_object.assert_called_once_with(Bucket="bucket", Key=head_key)
+
+
+def test_analyze_repo_paginates_listing():
+    doctor = _make_doctor(NESTED_PREFIX)
+
+    def side_effect(**kwargs):
+        if "ContinuationToken" not in kwargs:
+            return {
+                "Contents": [
+                    {
+                        "Key": f"{NESTED_PREFIX}/refs/heads/main/{SHA1}.bundle",
+                        "LastModified": datetime.datetime.now(tz=datetime.timezone.utc),
+                    }
+                ],
+                "NextContinuationToken": "token",
+            }
+        assert kwargs["ContinuationToken"] == "token"
+        return {
+            "Contents": [
+                {
+                    "Key": f"{NESTED_PREFIX}/refs/heads/main/{SHA2}.bundle",
+                    "LastModified": datetime.datetime.now(tz=datetime.timezone.utc),
+                }
+            ],
+        }
+
+    doctor.s3.list_objects_v2.side_effect = side_effect
+
+    repos = doctor.analyze_repo()
+
+    bundles = repos[NESTED_PREFIX]["refs"]["refs/heads/main"]["bundles"]
+    assert {b["sha"] for b in bundles} == {SHA1, SHA2}
+
+
+def _repos_with_two_main_bundles():
+    last_modified = datetime.datetime.now(tz=datetime.timezone.utc)
+    return {
+        NESTED_PREFIX: {
+            "refs": {
+                "refs/heads/main": {
+                    "protected": False,
+                    "bundles": [
+                        {"sha": SHA1, "lastModified": last_modified},
+                        {"sha": SHA2, "lastModified": last_modified},
+                    ],
+                }
+            },
+            "HEAD": "refs/heads/main",
+        }
+    }
+
+
+def test_fix_multiple_bundles_deletes_stale_bundle_under_nested_prefix():
+    doctor = _make_doctor(NESTED_PREFIX, delete_bundle=True)
+    repos = _repos_with_two_main_bundles()
+
+    with patch("builtins.input", side_effect=["1", ""]):
+        doctor.fix_multiple_bundles(repos, NESTED_PREFIX, "refs/heads/main")
+
+    doctor.s3.delete_object.assert_called_once_with(
+        Bucket="bucket",
+        Key=f"{NESTED_PREFIX}/refs/heads/main/{SHA2}.bundle",
+    )
+    doctor.s3.copy_object.assert_not_called()
+
+
+def test_fix_multiple_bundles_moves_stale_bundle_under_nested_prefix():
+    doctor = _make_doctor(NESTED_PREFIX, delete_bundle=False)
+    repos = _repos_with_two_main_bundles()
+
+    with patch("builtins.input", side_effect=["1", ""]):
+        doctor.fix_multiple_bundles(repos, NESTED_PREFIX, "refs/heads/main")
+
+    doctor.s3.copy_object.assert_called_once()
+    copy_kwargs = doctor.s3.copy_object.call_args.kwargs
+    source_key = f"{NESTED_PREFIX}/refs/heads/main/{SHA2}.bundle"
+    assert copy_kwargs["CopySource"] == {"Bucket": "bucket", "Key": source_key}
+    assert copy_kwargs["Key"].startswith(f"{NESTED_PREFIX}/refs/heads/main_")
+    assert copy_kwargs["Key"].endswith(f"/{SHA2}.bundle")
+    doctor.s3.delete_object.assert_called_once_with(Bucket="bucket", Key=source_key)
+
+
+def test_fix_head_writes_prefix_relative_ref():
+    doctor = _make_doctor(NESTED_PREFIX)
+    repos = {
+        NESTED_PREFIX: {
+            "refs": {"refs/heads/main": {"protected": False, "bundles": []}},
+            "HEAD": "Invalid",
+        }
+    }
+
+    with patch("builtins.input", side_effect=["1"]):
+        doctor.fix_head(repos, NESTED_PREFIX)
+
+    doctor.s3.put_object.assert_called_once_with(
+        Bucket="bucket",
+        Key=f"{NESTED_PREFIX}/HEAD",
+        Body="refs/heads/main",
+    )
+
+
+def test_doctor_run_healthy_nested_repo_never_prompts(capsys):
+    """Regression for the incident where the LFS store was reported as a branch
+    with multiple bundles and the interactive fixer offered to delete LFS objects."""
+    doctor = _make_doctor(NESTED_PREFIX)
+    keys = [
+        f"{NESTED_PREFIX}/HEAD",
+        f"{NESTED_PREFIX}/lfs/{LFS_OID1}",
+        f"{NESTED_PREFIX}/lfs/{LFS_OID2}",
+        f"{NESTED_PREFIX}/refs/heads/main/{SHA1}.bundle",
+        f"{NESTED_PREFIX}/refs/heads/main/LOCK#.lock",
+    ]
+    doctor.s3.list_objects_v2.side_effect = _list_objects_mock(keys)
+    doctor.s3.get_object.return_value = {"Body": BytesIO(b"refs/heads/main")}
+    probe = MagicMock()
+    probe.exceptions.ClientError = ClientError
+    probe.list_objects_v2.return_value = {"Contents": []}
+
+    with (
+        patch("git_remote_s3.manage.register_s3_access_grants_strict", return_value=probe),
+        patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
+        patch("builtins.input", side_effect=AssertionError("interactive fixer must not trigger")),
+    ):
+        doctor.run()
+
+    out = capsys.readouterr().out
+    assert " refs/heads/main: Ok" in out
+    assert "HEAD: refs/heads/main" in out
+    assert "lfs" not in out
+    assert "Multiple refs" not in out
+    assert "No stale locks found." in out
