@@ -10,6 +10,7 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 - Auto-install of the LFS transfer agent on first remote-helper run
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
+- Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
 
 Not affiliated with or endorsed by Amazon Web Services.
 

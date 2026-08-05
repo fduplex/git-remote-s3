@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 # Modifications Copyright 2026 FullDuplex Media
-# Changed: Added doctor Access Grants diagnostics, bucket-alias resolution, and scoped list prefixes.
+# Changed: Doctor Access Grants diagnostics, bucket-alias resolution, scoped list prefixes, prefix-relative key parsing.
 
 import boto3
 from .remote import parse_git_url, DEFAULT_LOCK_TTL_SECONDS
@@ -75,7 +75,8 @@ class Doctor:
                     head_ref = ref
                 ref_value = repos[r]["refs"][ref]
                 part_1 = "*" if ref_value["protected"] else ""
-                part_2 = "Ok" if len(ref_value["bundles"]) == 1 else "Multiple refs"
+                bundle_count = len(ref_value["bundles"])
+                part_2 = "Ok" if bundle_count == 1 else ("No bundles" if bundle_count == 0 else "Multiple refs")
                 print(f" {part_1} {ref}: {part_2}")
             if head_ref == "Invalid":
                 repos[r]["HEAD"] = head_ref
@@ -137,9 +138,21 @@ class Doctor:
         # After fixing references, scan and handle stale locks
         self.list_and_handle_stale_locks()
 
+    def list_repo_objects(self) -> list[dict]:
+        list_prefix = scoped_list_prefix(self.prefix)
+        res = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=list_prefix)
+        contents = res.get("Contents", [])
+        next_token = res.get("NextContinuationToken", None)
+
+        while next_token:
+            res = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=list_prefix, ContinuationToken=next_token)
+            contents.extend(res.get("Contents", []))
+            next_token = res.get("NextContinuationToken", None)
+        return contents
+
     def list_and_handle_stale_locks(self):
         print("\nScanning for stale locks...")
-        objs = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=scoped_list_prefix(self.prefix)).get("Contents", [])
+        objs = self.list_repo_objects()
 
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         stale = []
@@ -172,63 +185,67 @@ class Doctor:
             print("\nRun with --delete-stale-locks to remove them automatically.")
 
     def analyze_repo(self):
-        objs = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=scoped_list_prefix(self.prefix)).get("Contents", [])
-
-        repos: dict[str, Any] = {}
-        for o in objs:
+        # Keys are parsed relative to the repo prefix (which may be nested, e.g.
+        # "vendors/extrahop"), mirroring S3Remote.list_refs. Only HEAD and refs/*
+        # matter here: lfs/* is the LFS object store, and locks/archives under a
+        # ref are not bundles (same filter set as S3Remote.get_bundles_for_ref).
+        list_prefix = scoped_list_prefix(self.prefix)
+        repo_name = self.prefix if self.prefix else "<bucket root>"
+        repos: dict[str, Any] = {repo_name: {"refs": {}, "HEAD": "Missing"}}
+        refs = repos[repo_name]["refs"]
+        for o in self.list_repo_objects():
             key = o["Key"]
-            key_parts = key.split("/")
-            repo_name = key_parts[0]
-            if repo_name not in repos:
-                repos[repo_name] = {"refs": {}, "HEAD": "Missing"}
-            refs = "/".join(key_parts[1:-1])
-            if key_parts[1] == "HEAD":
+            rel = key.removeprefix(list_prefix)
+            if rel == "HEAD":
                 head_ref = self.s3.get_object(Bucket=self.bucket, Key=key).get("Body").read().decode("utf-8").strip()
                 repos[repo_name]["HEAD"] = head_ref
                 continue
-            if not repos[repo_name]["refs"].get(refs, None):
-                repos[repo_name]["refs"][refs] = {"protected": False, "bundles": []}
-            if key_parts[-1] == "PROTECTED#":
-                repos[repo_name]["refs"][refs]["protected"] = True
-            else:
-                sha = key_parts[-1].split(".")[0]
-                repos[repo_name]["refs"][refs]["bundles"].append({"sha": sha, "lastModified": o["LastModified"]})
+            if not rel.startswith("refs/"):
+                continue
+            ref, _, leaf = rel.rpartition("/")
+            if leaf == "PROTECTED#":
+                refs.setdefault(ref, {"protected": False, "bundles": []})["protected"] = True
+            elif leaf.endswith(".bundle"):
+                refs.setdefault(ref, {"protected": False, "bundles": []})["bundles"].append(
+                    {"sha": leaf.removesuffix(".bundle"), "lastModified": o["LastModified"]}
+                )
         return repos
 
     def fix_multiple_bundles(self, repos: dict, r: str, ref: str) -> None:
         print(f"\nFix multiple bundles for repo {r} and ref {ref}")
+        list_prefix = scoped_list_prefix(self.prefix)
         bundles = repos[r]["refs"][ref]["bundles"]
-        for i, sha in enumerate(bundles):
-            print(f"{i + 1}. {sha['sha']} {sha['lastModified']}")
+        for i, bundle in enumerate(bundles):
+            print(f"{i + 1}. {bundle['sha']} {bundle['lastModified']}")
         while True:
             try:
                 i = int(input("Enter the number of the bundle to keep: "))
                 if i > 0 and i <= len(bundles):
-                    sha = bundles[i - 1]["sha"]
-                    print(f"Keeping {sha}")
+                    keep_sha = bundles[i - 1]["sha"]
+                    print(f"Keeping {keep_sha}")
                     input("Press enter to confirm or Ctrl+C to cancel")
-                    for s in [sha["sha"] for sha in bundles]:
-                        if s != sha:
+                    for sha in [b["sha"] for b in bundles]:
+                        if sha != keep_sha:
                             if self.delete_bundle:
-                                print(f"Removing {s}")
+                                print(f"Removing {sha}")
                                 self.s3.delete_object(
                                     Bucket=self.bucket,
-                                    Key=f"{self.prefix}/{ref}/{s}.bundle",
+                                    Key=f"{list_prefix}{ref}/{sha}.bundle",
                                 )
                             else:
                                 tmp_branch = f"{ref}_{str(uuid.uuid4())[:8]}"
-                                print(f"Moving {s} to new branch {tmp_branch}")
+                                print(f"Moving {sha} to new branch {tmp_branch}")
                                 self.s3.copy_object(
                                     CopySource={
                                         "Bucket": self.bucket,
-                                        "Key": f"{self.prefix}/{ref}/{s}.bundle",
+                                        "Key": f"{list_prefix}{ref}/{sha}.bundle",
                                     },
                                     Bucket=self.bucket,
-                                    Key=f"{self.prefix}/{tmp_branch}/{s}.bundle",
+                                    Key=f"{list_prefix}{tmp_branch}/{sha}.bundle",
                                 )
                                 self.s3.delete_object(
                                     Bucket=self.bucket,
-                                    Key=f"{self.prefix}/{ref}/{s}.bundle",
+                                    Key=f"{list_prefix}{ref}/{sha}.bundle",
                                 )
                     break
             except ValueError:
@@ -236,7 +253,7 @@ class Doctor:
 
     def fix_head(self, repos: dict, r: str) -> None:
         print(f"\nFix invalid HEAD for repo {r}")
-        heads = [k for k in repos[r]["refs"] if "heads" in k]
+        heads = [k for k in repos[r]["refs"] if k.startswith("refs/heads/")]
         for i, head in enumerate(heads):
             print(f"{i + 1}. {head.split('/')[-1]}")
         while True:
@@ -245,9 +262,11 @@ class Doctor:
                 if i > 0 and i <= len(heads):
                     head = heads[i - 1]
                     print(f"Setting {head} as HEAD")
+                    # Body must be the prefix-relative ref name; that is what
+                    # S3Remote.get_remote_head compares against.
                     self.s3.put_object(
                         Bucket=self.bucket,
-                        Key=f"{self.prefix}/HEAD",
+                        Key=f"{scoped_list_prefix(self.prefix)}HEAD",
                         Body=head,
                     )
                     break
