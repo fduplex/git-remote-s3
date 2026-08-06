@@ -33,6 +33,7 @@ from .common import (
     resolve_bucket_alias,
     register_s3_access_grants,
     resolve_bucket_region,
+    synthetic_lfs_url,
     BucketAliasError,
     TRANSFER_CONFIG,
 )
@@ -147,8 +148,14 @@ class Mode:
 def maybe_install_lfs_agent(remote_name: str) -> None:
     """Install the git-lfs-s3 transfer agent in local git config if unset.
 
-    Skipped when GIT_REMOTE_S3_AUTO_INSTALL_LFS is 0/false/no, or when
-    lfs.standalonetransferagent or remote.<name>.lfsurl is already set.
+    Also writes remote.<name>.lfsurl: git-lfs parses an `s3://` remote as an SSH-style URL with
+    hostname "s3" and probes it with `ssh s3 git-lfs-transfer ...` on every push, blocking ~10s on
+    the name resolution failure before falling back. A standalone transfer agent does not suppress
+    that probe; an HTTPS-shaped endpoint does. The URL is a never-contacted match key only.
+
+    Skipped when GIT_REMOTE_S3_AUTO_INSTALL_LFS is 0/false/no, when remote.<name>.lfsurl is already
+    set, or when lfs.standalonetransferagent names an agent other than ours. An existing clone whose
+    config was written before the lfsurl key existed still gets it added.
     """
     if os.environ.get("GIT_REMOTE_S3_AUTO_INSTALL_LFS", "1").lower() in (
         "0",
@@ -157,13 +164,39 @@ def maybe_install_lfs_agent(remote_name: str) -> None:
     ):
         return
 
-    if _git_config_get("lfs.standalonetransferagent"):
+    existing_agent = _git_config_get("lfs.standalonetransferagent")
+    if existing_agent is not None and existing_agent != "git-lfs-s3":
         return
     if _git_config_get(f"remote.{remote_name}.lfsurl"):
         return
 
-    _git_config_run("--add", "lfs.customtransfer.git-lfs-s3.path", "git-lfs-s3")
-    _git_config_run("--add", "lfs.standalonetransferagent", "git-lfs-s3")
+    if existing_agent is None:
+        _git_config_run("--add", "lfs.customtransfer.git-lfs-s3.path", "git-lfs-s3")
+        _git_config_run("--add", "lfs.standalonetransferagent", "git-lfs-s3")
+
+    lfs_url = _remote_lfs_url(remote_name)
+    if lfs_url is not None:
+        _git_config_run("--add", f"remote.{remote_name}.lfsurl", lfs_url)
+
+
+def _remote_lfs_url(remote_name: str) -> str | None:
+    """Renders the synthetic LFS endpoint for a configured s3:// remote, or None.
+
+    The URL is built from the remote's bucket component verbatim so a DNS bucket alias stays an
+    alias, matching what `git-lfs-s3 install --remote` writes.
+    """
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", remote_name],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    _, _, bucket, prefix = parse_git_url(url)
+    if bucket is None or prefix is None:
+        return None
+    return synthetic_lfs_url(bucket, prefix)
 
 
 def _git_config_get(key: str) -> str | None:

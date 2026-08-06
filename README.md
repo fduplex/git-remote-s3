@@ -8,6 +8,7 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 - Fix for LFS temp-file paths when the repo is used as a submodule
 - Per-remote LFS scoping, so a repo can mix an S3 LFS remote with non-S3 remotes
 - Auto-install of the LFS transfer agent on first remote-helper run
+- Pushes no longer stall ~10s per push on git-lfs's pure-SSH endpoint probe of the `s3://` URL — the auto-install writes `remote.<name>.lfsurl`, which suppresses it
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
 - Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
