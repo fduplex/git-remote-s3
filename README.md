@@ -39,6 +39,7 @@ It also provide an implementation of the [git-lfs custom transfer](https://githu
   - [Create a new repo](#create-a-new-repo)
   - [Clone a repo](#clone-a-repo)
   - [DNS bucket aliases](#dns-bucket-aliases)
+  - [Bucket region cache](#bucket-region-cache)
   - [S3 Access Grants](#s3-access-grants)
   - [Branches, etc.](#branches-etc)
   - [Using S3 remotes for submodules](#using-s3-remotes-for-submodules)
@@ -236,6 +237,25 @@ git config s3.dns-alias false
 ```
 
 Both keys are booleans; setting the per-remote key to `true` re-enables aliasing for that remote even when `s3.dns-alias` is `false`. The per-remote key applies where a remote name is available (the git remote helper, the LFS transfer agent, `git-lfs-s3 install --remote`); the `git-s3` CLI takes a URI rather than a remote name and honors only `s3.dns-alias`.
+
+### Bucket region cache
+
+> **Fork addition** (not in upstream awslabs/git-remote-s3): the bucket's region is detected once and remembered in the repo's local git config.
+
+Every S3 client the remote helper builds is pinned to the bucket's own region, which otherwise costs a `HeadBucket` round trip on every single git command. The first successful detection is written to the repo-local git config as `remote.<name>.s3region`, and every later invocation reads it from there instead:
+
+```bash
+git config --get remote.origin.s3region
+# eu-west-1
+```
+
+The value is written on the first clone, fetch or push against a remote, and only for a real remote name — a push straight to a URI (`git push s3://bucket/repo ...`) detects the region and does not cache it. For submodules the key lands in the submodule's own config under `.git/modules/<name>/config`.
+
+If a bucket ever moves to another region, the cached value goes stale. The helper notices the redirect S3 returns, drops the key and retries once, so the operation still succeeds; you can also clear it by hand:
+
+```bash
+git config --unset remote.origin.s3region
+```
 
 ### S3 Access Grants
 

@@ -24,6 +24,9 @@ from .git import validate_ref_name
 
 logger = logging.getLogger(__name__)
 
+# How the object stores we support spell "that key is not there" on HeadObject.
+_NOT_FOUND_CODES = ("404", "NoSuchKey", "NotFound")
+
 
 def _resolve_git_dir() -> str:
     """Returns the absolute path of the current git directory.
@@ -120,10 +123,11 @@ class LFSProcess:
             client.head_object(Bucket=self.s3_bucket.name, Key=key)
             return True
         except client.exceptions.ClientError as e:
-            # HeadObject has no XML error body to parse a semantic code from, so botocore
-            # falls back to the raw HTTP status code as the error Code; "NoSuchKey" is never
-            # raised here (unlike GetObject).
-            if e.response.get("Error", {}).get("Code") == "404":
+            # On AWS, HeadObject has no XML error body to parse a semantic code from, so botocore
+            # falls back to the raw HTTP status "404". S3-compatible backends (MinIO, Ceph RGW) do
+            # send a body and report "NoSuchKey" or "NotFound"; treating those as a hard failure
+            # would turn every first upload of an object into a transfer error.
+            if e.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
                 return False
             raise
 

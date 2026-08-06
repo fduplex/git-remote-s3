@@ -26,13 +26,11 @@ def archive(*, folder: str, ref: str) -> str:
     result = subprocess.run(
         ["git", "archive", "--format", "zip", "--output", file_path, ref],
         capture_output=True,
-        check=True,
     )
 
-    if result.returncode == 0:
-        return file_path
-    else:
-        raise GitError(result.stderr.decode("utf8"))
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to archive {ref}")
+    return file_path
 
 
 def bundle(*, folder: str, sha: str, ref: str, progress: bool = False, quiet: bool = False) -> str:
@@ -63,13 +61,11 @@ def bundle(*, folder: str, sha: str, ref: str, progress: bool = False, quiet: bo
         args,
         stdout=subprocess.PIPE,
         stderr=None if (progress and not quiet) else subprocess.PIPE,
-        check=True,
     )
 
-    if result.returncode == 0:
-        return file_path
-    else:
+    if result.returncode != 0:
         raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to bundle {ref}")
+    return file_path
 
 
 def unbundle(*, folder: str, sha: str, ref: str, progress: bool = False):
@@ -80,16 +76,21 @@ def unbundle(*, folder: str, sha: str, ref: str, progress: bool = False):
         sha (str): the sha of the bundle. A bundle is stored as sha.bundle
         ref (str): the ref to checkout after unbundling
         progress (bool): let git render its own progress meter on stderr
+
+    Raises:
+        GitError: if git could not apply the bundle
     """
     args = ["git", "bundle", "unbundle"]
     if progress:
         args.append("--progress")
     args += [f"{folder}/{sha}.bundle", ref]
-    subprocess.run(
+    result = subprocess.run(
         args,
         stdout=sys.stderr,
-        check=True,
     )
+
+    if result.returncode != 0:
+        raise GitError(f"failed to unbundle {sha} into {ref}")
 
 
 def rev_parse(ref: str) -> str:

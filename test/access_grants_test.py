@@ -85,35 +85,10 @@ def test_s3remote_registers_plugin_on_its_client(session_cls, plugin_cls):
     session = session_cls.return_value
     client = session.client.return_value
 
-    S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    assert S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").s3 is client
 
     plugin_cls.assert_called_once_with(client, fallback_enabled=True, customer_session=session._session)
     client.meta.events.register.assert_called_once_with("before-sign.s3", _detect_access_grants_fallback)
-
-
-@patch("git_remote_s3.common.S3AccessGrantsPlugin")
-@patch("boto3.Session")
-def test_s3remote_auth_probe_uses_trailing_slash_prefix(session_cls, plugin_cls):
-    # The existence-check probe must scope its listing to exactly this repo,
-    # so a sibling repo whose prefix is a string-prefix of ours (e.g.
-    # "core/climate" for "core/cli") is never cross-listed.
-    client = session_cls.return_value.client.return_value
-
-    S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    client.list_objects_v2.assert_called_once_with(Bucket="test_bucket", Prefix="test_prefix/")
-
-
-@patch("git_remote_s3.common.S3AccessGrantsPlugin")
-@patch("boto3.Session")
-def test_s3remote_auth_probe_empty_prefix_lists_whole_bucket(session_cls, plugin_cls):
-    # A bucket-root repo (prefix == "") must list Prefix="" rather than the
-    # never-matching "/".
-    client = session_cls.return_value.client.return_value
-
-    S3Remote(UriScheme.S3, None, "test_bucket", "")
-
-    client.list_objects_v2.assert_called_once_with(Bucket="test_bucket", Prefix="")
 
 
 def test_scoped_list_prefix_empty():
@@ -234,7 +209,7 @@ def test_s3remote_pins_client_to_bucket_region(session_cls, plugin_cls):
     session = session_cls.return_value
     session.client.return_value.head_bucket.return_value = {"BucketRegion": "us-west-2"}
 
-    S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")._ensure_s3()
 
     session.client.assert_any_call("s3", region_name="us-west-2")
 

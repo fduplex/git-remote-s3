@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import lfs
@@ -172,12 +173,14 @@ def test_upload_skips_when_object_exists_via_head_object():
     assert event == {"event": "complete", "oid": "abc123"}
 
 
-def test_upload_proceeds_when_head_object_404s():
-    # HeadObject's error body is empty, so botocore reports the raw HTTP status "404" as the
-    # error Code rather than a semantic "NoSuchKey" (which GetObject would raise instead).
+@pytest.mark.parametrize("code", ["404", "NoSuchKey", "NotFound"])
+def test_upload_proceeds_when_head_object_reports_not_found(code):
+    # On AWS the HeadObject error body is empty, so botocore reports the raw HTTP status "404";
+    # S3-compatible backends send a body and name the condition instead. All three mean the same
+    # thing, and reading any of them as a hard failure would break every first upload.
     client = MagicMock()
     client.exceptions.ClientError = ClientError
-    client.head_object.side_effect = _head_object_error("404")
+    client.head_object.side_effect = _head_object_error(code)
     proc, bucket = _make_upload_proc(client)
 
     with patch("sys.stdout", new_callable=StringIO) as stdout:

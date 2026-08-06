@@ -1,35 +1,9 @@
 import subprocess
-import tempfile
 import pytest
 from unittest.mock import patch
+from conftest import git_config_get as _config_get
 from git_remote_s3 import S3Remote, UriScheme
 from git_remote_s3.remote import maybe_install_lfs_agent
-
-
-@pytest.fixture
-def temp_git_repo(monkeypatch):
-    with tempfile.TemporaryDirectory(prefix="git_remote_s3_autoinstall_") as repo:
-        subprocess.run(
-            ["git", "init", "-q", repo],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        monkeypatch.chdir(repo)
-        for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_REMOTE_S3_AUTO_INSTALL_LFS"):
-            monkeypatch.delenv(var, raising=False)
-        yield repo
-
-
-def _config_get(key: str):
-    res = subprocess.run(
-        ["git", "config", "--get", key],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    if res.returncode != 0:
-        return None
-    return res.stdout.decode("utf-8").strip() or None
 
 
 def test_install_writes_both_keys_when_unset(temp_git_repo):
@@ -100,22 +74,27 @@ def test_opt_out_env_var_skips_install(temp_git_repo, monkeypatch, value):
     assert _config_get("lfs.customtransfer.git-lfs-s3.path") is None
 
 
-def test_s3remote_init_with_remote_name_triggers_install(temp_git_repo):
+def test_s3remote_installs_agent_on_first_s3_use(temp_git_repo):
     with patch("boto3.Session.client") as client_mock:
+        client_mock.return_value.head_bucket.return_value = {}
         client_mock.return_value.list_objects_v2.return_value = {"Contents": []}
-        S3Remote(
+        remote = S3Remote(
             UriScheme.S3,
             None,
             "test_bucket",
             "test_prefix",
             remote_name="origin",
         )
+        # The AWS setup, and the config writes that go with it, are deferred off the startup path.
+        assert _config_get("lfs.standalonetransferagent") is None
+        remote._ensure_s3()
     assert _config_get("lfs.standalonetransferagent") == "git-lfs-s3"
 
 
-def test_s3remote_init_without_remote_name_does_not_install(temp_git_repo):
+def test_s3remote_without_remote_name_does_not_install(temp_git_repo):
     with patch("boto3.Session.client") as client_mock:
+        client_mock.return_value.head_bucket.return_value = {}
         client_mock.return_value.list_objects_v2.return_value = {"Contents": []}
-        S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+        S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")._ensure_s3()
     assert _config_get("lfs.standalonetransferagent") is None
     assert _config_get("lfs.customtransfer.git-lfs-s3.path") is None

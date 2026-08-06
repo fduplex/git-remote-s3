@@ -20,9 +20,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import os
 import concurrent.futures
 from threading import Lock
+from typing import Any, NoReturn
 
 import botocore.exceptions
 from git_remote_s3 import git
@@ -31,8 +33,7 @@ from .common import (
     parse_git_url,
     resolve_bucket_alias,
     register_s3_access_grants,
-    s3_region_kwargs,
-    scoped_list_prefix,
+    resolve_bucket_region,
     BucketAliasError,
 )
 import botocore
@@ -55,8 +56,21 @@ if "remote" in __name__:
 
 DEFAULT_LOCK_TTL_SECONDS = 60
 
+# Bucket region, cached per remote in the repo's local git config so the HeadBucket probe is only
+# paid once per clone. Documented in the README, including how to drop it if the bucket moves.
+_REGION_CONFIG_KEY = "remote.{remote_name}.s3region"
+
+# S3 answers a request aimed at the wrong region with one of these. A region-agnostic client is
+# redirected; a client pinned to the wrong region instead fails to verify the SigV4 scope and
+# answers AuthorizationHeaderMalformed, which is what the cached region produces.
+_REGION_REDIRECT_CODES = ("PermanentRedirect", "301", "AuthorizationHeaderMalformed")
+
 _KB = 1024
 _MB = 1024**2
+
+# Rendering on every boto3 chunk (256 KiB) from up to 8 transfer threads costs far more writes
+# than a terminal can show; a tenth of a second still reads as continuous motion.
+_PROGRESS_MIN_INTERVAL_S = 0.1
 
 # 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
 # 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling.
@@ -82,10 +96,14 @@ class TransferProgress:
         self._seen_so_far = 0
         self._lock = Lock()
         self._rendered = False
+        self._last_render = 0.0
 
     def __call__(self, bytes_amount: int) -> None:
         with self._lock:
             self._seen_so_far += bytes_amount
+            now = time.monotonic()
+            if self._rendered and now - self._last_render < _PROGRESS_MIN_INTERVAL_S:
+                return
             if self.total_bytes:
                 pct = min(100, int(self._seen_so_far * 100 / self.total_bytes))
                 unit, divisor, decimals = self._unit_for(self.total_bytes)
@@ -101,6 +119,7 @@ class TransferProgress:
                 sys.stderr.write(f"\r{self.action} {self.label}: {seen_disp:.{decimals}f} {unit}")
             sys.stderr.flush()
             self._rendered = True
+            self._last_render = now
 
     @staticmethod
     def _unit_for(reference_bytes: int) -> tuple[str, int, int]:
@@ -114,7 +133,6 @@ class TransferProgress:
             if self._rendered:
                 sys.stderr.write("\n")
                 sys.stderr.flush()
-                self._rendered = False
 
 
 class BucketNotFoundError(Exception):
@@ -153,8 +171,8 @@ def maybe_install_lfs_agent(remote_name: str) -> None:
     if _git_config_get(f"remote.{remote_name}.lfsurl"):
         return
 
-    _git_config_add("lfs.customtransfer.git-lfs-s3.path", "git-lfs-s3")
-    _git_config_add("lfs.standalonetransferagent", "git-lfs-s3")
+    _git_config_run("--add", "lfs.customtransfer.git-lfs-s3.path", "git-lfs-s3")
+    _git_config_run("--add", "lfs.standalonetransferagent", "git-lfs-s3")
 
 
 def _git_config_get(key: str) -> str | None:
@@ -169,43 +187,48 @@ def _git_config_get(key: str) -> str | None:
         return None
 
 
-def _git_config_add(key: str, value: str) -> None:
+def _git_config_run(*args: str) -> None:
+    """Applies a best-effort `git config` mutation, e.g. ("--local", key, value).
+
+    Run as a subprocess rather than by editing a config file so gitdir redirection is handled by
+    git itself: in a submodule the local config lives under .git/modules/<name>/config, which git
+    resolves from the environment the helper inherited.
+    """
     with contextlib.suppress(FileNotFoundError):
         subprocess.run(
-            ["git", "config", "--add", key, value],
+            ["git", "config", *args],
             check=False,
             stderr=subprocess.DEVNULL,
         )
 
 
+def _single_line(message: str) -> str:
+    """Flattens git's stderr so it can ride inside a single `error <ref> "..."` protocol line."""
+    return " ".join(message.replace('"', "'").split()) or "unknown git error"
+
+
 class S3Remote:
-    def __init__(self, uri_scheme, profile, bucket, prefix, *, remote_name=None):
+    def __init__(self, uri_scheme, profile, bucket, prefix, *, remote_name=None, remote_url=None):
+        """Prepares the helper without touching AWS.
+
+        git wants `capabilities` answered — and the `option` lines that follow it acknowledged —
+        before it sends the first command that needs the remote, so nothing here may resolve
+        credentials, do DNS or call S3; all of that is deferred to _ensure_s3.
+        """
         self.uri_scheme = uri_scheme
         self.profile = profile
         self.bucket = bucket
         self.prefix = prefix
         self.remote_name = remote_name
-        if profile:
-            self.session = boto3.Session(profile_name=profile)
-        else:
-            self.session = boto3.Session()
-        self.s3 = register_s3_access_grants(
-            self.session.client("s3", **s3_region_kwargs(self.session, bucket)),
-            self.session,
-        )
-        try:
-            # Scope to exactly this repo: a bare Prefix="core/cli" also matches
-            # a sibling repo like "core/climate", so use the trailing-slash
-            # scoped prefix instead.
-            self.s3.list_objects_v2(Bucket=bucket, Prefix=scoped_list_prefix(prefix))
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchBucket":
-                raise BucketNotFoundError(bucket) from e
-            if e.response["Error"]["Code"] == "AccessDenied":
-                raise NotAuthorizedError("ListObjectsV2", bucket) from e
-            raise e
-
-        self.bucket = bucket
+        # boto3 clients are dynamically typed; there are no first-party stubs.
+        self._s3: Any = None
+        self._setup_lock = Lock()
+        self._region_from_config = False
+        # git passes the URL as argv[1] when pushing to a raw URL instead of to a configured
+        # remote; only a real remote name has a config section to cache the bucket region under.
+        named_remote = remote_name is not None and remote_name != remote_url and "://" not in remote_name
+        self._region_config_key = _REGION_CONFIG_KEY.format(remote_name=remote_name) if named_remote else None
+        self._is_shallow: bool | None = None
         self.mode = None
         self.progress = False
         self.verbosity = 1
@@ -222,29 +245,106 @@ class S3Remote:
         except ValueError:
             self.lock_ttl_seconds = DEFAULT_LOCK_TTL_SECONDS
 
-        # remote_name is only set when invoked via the remote-helper protocol;
-        # gating on it keeps tests from writing to the project's own git config.
-        if remote_name is not None:
-            maybe_install_lfs_agent(remote_name)
+    @property
+    def s3(self) -> Any:
+        """The S3 client, built on first use along with the rest of the AWS setup."""
+        self._ensure_s3()
+        return self._s3
+
+    def _ensure_s3(self) -> None:
+        """Pays the one-off AWS setup cost: alias resolution, session, region and client.
+
+        Idempotent, and locked because a multi-ref fetch reaches S3 from several threads at once.
+        """
+        if self._s3 is not None:
+            return
+        with self._setup_lock:
+            if self._s3 is not None:
+                return
+            with self._connecting_notice():
+                self.bucket = resolve_bucket_alias(self.bucket, self.remote_name)
+                self.session = boto3.Session(profile_name=self.profile) if self.profile else boto3.Session()
+                self._s3 = self._build_s3_client()
+                # remote_name is only set when invoked via the remote-helper protocol;
+                # gating on it keeps tests from writing to the project's own git config.
+                if self.remote_name is not None:
+                    maybe_install_lfs_agent(self.remote_name)
+
+    @contextlib.contextmanager
+    def _connecting_notice(self):
+        """Shows one status line on the terminal while the fixed setup cost is paid.
+
+        stdout carries the remote-helper protocol, so this can only go to stderr, which git leaves
+        attached to the user's terminal. `option verbosity` may not have arrived yet (git sends no
+        options at all for an ls-remote), so a tty is the primary gate.
+        """
+        notice = f"git-remote-s3: connecting to {self.bucket}..."
+        show = sys.stderr.isatty() and self.verbosity != 0
+        if show:
+            sys.stderr.write(f"\r{notice}")
+            sys.stderr.flush()
+        try:
+            yield
+        finally:
+            if show:
+                sys.stderr.write(f"\r{' ' * len(notice)}\r")
+                sys.stderr.flush()
+
+    def _build_s3_client(self) -> Any:
+        """Builds the S3 client pinned to the bucket's region, detecting it only when not cached."""
+        region = _git_config_get(self._region_config_key) if self._region_config_key else None
+        self._region_from_config = region is not None
+        if region is None:
+            region = resolve_bucket_region(self.session, self.bucket)
+            if region and self._region_config_key:
+                _git_config_run("--local", self._region_config_key, region)
+        return register_s3_access_grants(
+            self.session.client("s3", **({"region_name": region} if region else {})),
+            self.session,
+        )
+
+    def _retry_without_cached_region(self, error: ClientError) -> bool:
+        """Drops a stale cached region and rebuilds the client, so the caller can retry once.
+
+        Only a bucket that moved region can make the cache wrong, and only S3 can tell us so.
+
+        list_refs is deliberately the only caller: git always sends `list` or `list for-push`
+        before anything else in a helper session, so the stale cache is corrected there before any
+        other S3 call can be issued against it, and no other call site needs its own retry.
+        """
+        if error.response["Error"]["Code"] not in _REGION_REDIRECT_CODES or not self._region_from_config:
+            return False
+        if self._region_config_key:
+            _git_config_run("--local", "--unset", self._region_config_key)
+        self._s3 = self._build_s3_client()
+        return True
+
+    @staticmethod
+    def _raise_list_error(error: ClientError, bucket: str) -> NoReturn:
+        code = error.response["Error"]["Code"]
+        if code == "NoSuchBucket":
+            raise BucketNotFoundError(bucket) from error
+        if code == "AccessDenied":
+            raise NotAuthorizedError("ListObjectsV2", bucket) from error
+        raise error
 
     def list_refs(self, *, bucket: str, prefix: str) -> list:
-        # Scoped to the refs/ subtree server-side: in an LFS-heavy repo the
-        # "lfs/<oid>" keys vastly outnumber refs, so listing the bare repo
-        # prefix (see __init__'s existence-check probe, which does need the
-        # bare prefix) would paginate through every LFS object on every push
-        # and fetch. For a bucket-root repo (prefix == "") this scopes to
-        # "/refs"; keys there are written as f"{prefix}/{ref}/..." = "/refs/...",
-        # carrying that same leading slash, so the scoped prefix still matches
-        # them exactly as the bare-prefix filter below always did.
-        list_prefix = f"{prefix}/refs"
-        res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix)
-        contents = res.get("Contents", [])
-        next_token = res.get("NextContinuationToken", None)
+        """Lists the repo's refs, and is where a bad bucket or missing permission is reported.
 
-        while next_token:
-            res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix, ContinuationToken=next_token)
-            contents.extend(res.get("Contents", []))
-            next_token = res.get("NextContinuationToken", None)
+        git sends `list` (or `list for-push`) before any fetch or push, so this is the first S3
+        call of every invocation and carries the friendly error mapping that a dedicated
+        construction-time probe used to do at the cost of an extra round trip, and the one-shot
+        retry that corrects a stale cached bucket region.
+        """
+        contents: list = []
+        for attempt in range(2):
+            try:
+                contents = self._list_ref_objects(bucket=bucket, prefix=prefix)
+                break
+            except ClientError as e:
+                if attempt == 0 and self._retry_without_cached_region(e):
+                    continue
+                self._raise_list_error(e, bucket)
 
         contents.sort(key=lambda x: x["LastModified"])
         contents.reverse()
@@ -255,6 +355,26 @@ class S3Remote:
             if o["Key"].startswith(prefix + "/refs") and o["Key"].endswith(".bundle")
         ]
         return objs
+
+    def _list_ref_objects(self, *, bucket: str, prefix: str) -> list:
+        # Scoped to the refs/ subtree server-side: in an LFS-heavy repo the
+        # "lfs/<oid>" keys vastly outnumber refs, so listing the bare repo
+        # prefix would paginate through every LFS object on every push and
+        # fetch. For a bucket-root repo (prefix == "") this scopes to
+        # "/refs"; keys there are written as f"{prefix}/{ref}/..." = "/refs/...",
+        # carrying that same leading slash, so the scoped prefix still matches
+        # them exactly as the bare-prefix filter in list_refs always did.
+        list_prefix = f"{prefix}/refs"
+        res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix)
+        contents = res.get("Contents", [])
+        next_token = res.get("NextContinuationToken", None)
+
+        while next_token:
+            res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix, ContinuationToken=next_token)
+            contents.extend(res.get("Contents", []))
+            next_token = res.get("NextContinuationToken", None)
+
+        return contents
 
     @contextlib.contextmanager
     def transfer_progress(self, *, action: str, label: str, total_bytes: int | None = None, show_progress: bool = True):
@@ -280,6 +400,7 @@ class S3Remote:
                 download callback and `git bundle unbundle --progress`) into garbled output, so
                 process_fetch_cmds disables it for every fetch in a multi-ref batch.
         """
+        self._ensure_s3()
         sha, ref = args.split(" ")[1:]
         with self.fetched_refs_lock:
             if sha in self.fetched_refs:
@@ -341,9 +462,13 @@ class S3Remote:
             raise e
 
     def cmd_push(self, args: str) -> str:
+        self._ensure_s3()
         force_push = False
         local_ref, remote_ref = args.split(" ")[1].split(":")
         if not local_ref:
+            lease_error = self.delete_lease_violation_error(remote_ref)
+            if lease_error:
+                return lease_error
             return self.remove_remote_ref(remote_ref)
         if local_ref.startswith("+"):
             force_push = True
@@ -355,7 +480,7 @@ class S3Remote:
         # `git bundle create` in a shallow repo emits a bundle with truncated history and no
         # prerequisites that `git bundle verify` still calls complete, so the breakage would only
         # surface for whoever clones it next.
-        if git.is_shallow_repository():
+        if self._is_shallow_repository():
             return f'error {remote_ref} "cannot push from a shallow clone; run git fetch --unshallow first."?\n'
 
         contents = self.get_bundles_for_ref(remote_ref)
@@ -374,17 +499,19 @@ class S3Remote:
         lock_release_error: str | None = None
         try:
             sha = git.rev_parse(local_ref)
-            if pre_lock_bundle:
-                remote_sha = pre_lock_bundle.split("/")[-1].split(".")[0]
-                if not git.is_ancestor(remote_sha, sha):
-                    error = self.non_fast_forward_error(
-                        remote_ref=remote_ref,
-                        local_ref=local_ref,
-                        remote_sha=remote_sha,
-                        force_push=force_push,
-                    )
-                    if error:
-                        return error
+            pre_lock_sha = pre_lock_bundle.split("/")[-1].split(".")[0] if pre_lock_bundle else None
+            lease_error = self.lease_violation_error(remote_ref=remote_ref, remote_sha=pre_lock_sha)
+            if lease_error:
+                return lease_error
+            if pre_lock_sha is not None and not git.is_ancestor(pre_lock_sha, sha):
+                error = self.non_fast_forward_error(
+                    remote_ref=remote_ref,
+                    local_ref=local_ref,
+                    remote_sha=pre_lock_sha,
+                    force_push=force_push,
+                )
+                if error:
+                    return error
 
             # Create the bundle before acquiring the lock (local operation)
             temp_file = git.bundle(
@@ -421,17 +548,19 @@ class S3Remote:
                 )
 
             remote_to_remove = current_contents[0]["Key"] if len(current_contents) == 1 else None
-            if remote_to_remove is not None:
-                remote_sha = remote_to_remove.split("/")[-1].split(".")[0]
-                if not git.is_ancestor(remote_sha, sha):
-                    error = self.non_fast_forward_error(
-                        remote_ref=remote_ref,
-                        local_ref=local_ref,
-                        remote_sha=remote_sha,
-                        force_push=force_push,
-                    )
-                    if error:
-                        return error
+            remote_sha = remote_to_remove.split("/")[-1].split(".")[0] if remote_to_remove else None
+            lease_error = self.lease_violation_error(remote_ref=remote_ref, remote_sha=remote_sha)
+            if lease_error:
+                return lease_error
+            if remote_sha is not None and not git.is_ancestor(remote_sha, sha):
+                error = self.non_fast_forward_error(
+                    remote_ref=remote_ref,
+                    local_ref=local_ref,
+                    remote_sha=remote_sha,
+                    force_push=force_push,
+                )
+                if error:
+                    return error
 
             with self.transfer_progress(
                 action="Uploading",
@@ -488,9 +617,11 @@ class S3Remote:
                 )
 
             result = f"ok {remote_ref}\n"
-        except git.GitError:
-            logger.info(f"fatal: {local_ref} not found\n")
-            return f'error {remote_ref} "{local_ref} not found"?\n'
+        except git.GitError as e:
+            # A bundle that git refuses to build must fail this ref only; letting it escape would
+            # kill the helper and abandon the rest of the batch.
+            logger.info(f"fatal: {e}\n")
+            return f'error {remote_ref} "{_single_line(str(e))}"?\n'
         except boto3.exceptions.S3UploadFailedError as e:
             logger.info(f"fatal: {e}\n")
             return f'error {remote_ref} "{e}"?\n'
@@ -559,6 +690,56 @@ class S3Remote:
                 Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/PROTECTED#"
             ).get("Contents", [])
         return self._protected_cache[remote_ref]
+
+    def _is_shallow_repository(self) -> bool:
+        """Caches git's answer, which cannot change while the helper process is alive."""
+        if self._is_shallow is None:
+            self._is_shallow = git.is_shallow_repository()
+        return self._is_shallow
+
+    def lease_violation_error(self, *, remote_ref: str, remote_sha: str | None) -> str | None:
+        """Enforces a --force-with-lease claim against the remote state we are about to replace.
+
+        git checks the lease against what `list for-push` advertised, but the ref can move between
+        that advertisement and the push, so the comparison is redone here. It is deliberately
+        independent of the fast-forward check: a ref that moved to a new tip our push still
+        fast-forwards from would otherwise slip past the lease entirely.
+
+        Args:
+            remote_sha (str | None): the sha the remote holds now, or None when the ref is absent
+
+        Returns:
+            str | None: the error line to send back to git, or None when the lease holds
+        """
+        if remote_ref not in self.cas_refs:
+            return None
+        leased_sha = self.cas_refs[remote_ref]
+        actual = remote_sha or ""
+        if actual == leased_sha:
+            return None
+        return (
+            f'error {remote_ref} "stale info: remote ref is at {actual or "absent"}, not the '
+            f'{leased_sha or "absent"} it was leased against. Fetch first."?\n'
+        )
+
+    def delete_lease_violation_error(self, remote_ref: str) -> str | None:
+        """Applies the same lease to a `--force-with-lease --delete`.
+
+        A delete returns from cmd_push before either ancestry site, so it needs its own call. The
+        extra ListObjectsV2 is only paid when a lease was actually taken on this ref.
+
+        Returns:
+            str | None: the error line to send back to git, or None when the delete may proceed
+        """
+        if remote_ref not in self.cas_refs:
+            return None
+        bundles = self.get_bundles_for_ref(remote_ref)
+        if len(bundles) > 1:
+            # A ref carrying several bundles is broken; remove_remote_ref reports that on its own
+            # terms, and a lease verdict here would only mask it.
+            return None
+        remote_sha = bundles[0]["Key"].split("/")[-1].split(".")[0] if bundles else None
+        return self.lease_violation_error(remote_ref=remote_ref, remote_sha=remote_sha)
 
     def non_fast_forward_error(
         self, *, remote_ref: str, local_ref: str, remote_sha: str, force_push: bool
@@ -664,15 +845,20 @@ class S3Remote:
         elif option == "cas":
             # git sends `option cas <ref>:<sha>` per ref of a --force-with-lease push, after
             # `list for-push` and before the push line, and the push line carries no leading `+`.
-            ref, _, expected_sha = value.rpartition(":")
-            if ref and expected_sha:
-                self.cas_refs[ref] = expected_sha
+            # A lease that the ref must NOT exist arrives as an all-zero sha (verified against git
+            # 2.47, which sends 40 zeros; sha256 repos send 64). An empty value is accepted for the
+            # same meaning, and both normalise to "".
+            ref, separator, expected_sha = value.rpartition(":")
+            if ref and separator:
+                self.cas_refs[ref] = "" if not expected_sha.strip("0") else expected_sha
             answer = "ok\n"
         elif option == "verbosity":
             try:
                 self.verbosity = int(value)
             except ValueError:
-                self.verbosity = 1
+                # An unparseable level is answered `unsupported`; clobbering the level git already
+                # set would be a side effect of rejecting it.
+                pass
             else:
                 # Only ever raises the level, so GIT_REMOTE_S3_VERBOSE keeps winning over
                 # the default verbosity git sends on every invocation.
@@ -686,6 +872,8 @@ class S3Remote:
         sys.stdout.flush()
 
     def cmd_list(self, *, for_push: bool = False):
+        # Before reading self.bucket: the alias-resolved name is only known once setup has run.
+        self._ensure_s3()
         objs = self.list_refs(bucket=self.bucket, prefix=self.prefix)
         logger.info(objs)
 
@@ -753,6 +941,12 @@ class S3Remote:
             # Wait for all fetch commands to complete
             concurrent.futures.wait(futures)
 
+            # Every fetch is allowed to finish before the first failure is raised, but a failure
+            # must be raised: git takes a silent batch as a complete one and would leave the refs
+            # that never arrived silently missing. main() maps the known types to a `fatal:` line.
+            for future in futures:
+                future.result()
+
         logger.info(f"Completed processing {len(cmds)} fetch commands in parallel")
 
     def process_cmd(self, cmd: str):  # noqa: C901
@@ -809,18 +1003,13 @@ def main():
         sys.stderr.write(f"fatal: invalid remote '{remote}'. You need to have a bucket and a prefix.\n")
         sys.exit(1)
     try:
-        bucket = resolve_bucket_alias(bucket, remote_name)
-    except BucketAliasError as e:
-        sys.stderr.write(f"fatal: {e}\n")
-        sys.stderr.flush()
-        sys.exit(1)
-    try:
         s3remote = S3Remote(
             uri_scheme=uri_scheme,
             profile=profile,
             bucket=bucket,
             prefix=prefix,
             remote_name=remote_name,
+            remote_url=remote,
         )
         while True:
             line = sys.stdin.readline()
@@ -844,6 +1033,10 @@ def main():
             sys.exit(0)
         else:
             raise err
+    except BucketAliasError as e:
+        sys.stderr.write(f"fatal: {e}\n")
+        sys.stderr.flush()
+        sys.exit(1)
     except (
         ClientError,
         ProfileNotFound,

@@ -2,9 +2,39 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import tempfile
+
 import pytest
 
 from git_remote_s3 import common
+
+
+@pytest.fixture
+def temp_git_repo(monkeypatch):
+    """A throwaway git repo as cwd, with every env var the helper reads cleared.
+
+    GIT_REMOTE_S3_AUTO_INSTALL_LFS is unset rather than pinned so the auto-install tests exercise
+    the default; the config writes it causes land in this repo and never in the project's own.
+    """
+    with tempfile.TemporaryDirectory(prefix="git_remote_s3_test_") as repo:
+        subprocess.run(
+            ["git", "init", "-q", repo],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        monkeypatch.chdir(repo)
+        for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_REMOTE_S3_AUTO_INSTALL_LFS"):
+            monkeypatch.delenv(var, raising=False)
+        yield repo
+
+
+def git_config_get(key: str) -> str | None:
+    res = subprocess.run(["git", "config", "--get", key], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if res.returncode != 0:
+        return None
+    return res.stdout.decode("utf-8").strip() or None
 
 
 @pytest.fixture(autouse=True)

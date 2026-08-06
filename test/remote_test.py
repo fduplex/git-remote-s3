@@ -11,14 +11,16 @@ import boto3.exceptions
 import botocore
 import botocore.client
 import botocore.exceptions
+import pytest
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import S3Remote, UriScheme, git
-from git_remote_s3.remote import TransferProgress
+from git_remote_s3.remote import NotAuthorizedError, TransferProgress
 
 SHA1 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8a"
 SHA2 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8b"
 MOVED_SHA = "c105d19ba64965d2c9d3d3246e7269059ef8bb8c"
+NULL_SHA = "0" * 40
 INVALID_SHA = "z45"
 BUNDLE_SUFFIX = ".bundle"
 MOCK_BUNDLE_CONTENT = b"MOCK_BUNDLE_CONTENT"
@@ -72,10 +74,10 @@ def test_cmd_list(session_client_mock, stdout_mock):
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
 
     session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA1])
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
     s3_remote.cmd_list()
     assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
@@ -99,10 +101,10 @@ def test_list_refs(session_client_mock, stdout_mock):
         ]
     }
 
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "nested/test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     refs = s3_remote.list_refs(bucket=s3_remote.bucket, prefix=s3_remote.prefix)
     assert len(refs) == 2
     assert f"refs/heads/{BRANCH}/{SHA1}.bundle" in refs
@@ -146,7 +148,7 @@ def test_list_refs_scopes_listing_away_from_lfs_objects(session_client_mock, std
 
 @patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
-def test_list_refs_empty_prefix_probe_scopes_to_leading_slash_refs(session_client_mock, stdout_mock):
+def test_list_refs_empty_prefix_scopes_to_leading_slash_refs(session_client_mock, stdout_mock):
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "")
 
     session_client_mock.return_value.list_objects_v2.return_value = {
@@ -161,14 +163,11 @@ def test_list_refs_empty_prefix_probe_scopes_to_leading_slash_refs(session_clien
     refs = s3_remote.list_refs(bucket=s3_remote.bucket, prefix=s3_remote.prefix)
 
     calls = session_client_mock.return_value.list_objects_v2.call_args_list
-    # The __init__ existence-check probe must list Prefix="" rather than the
-    # never-matching "/".
-    assert calls[0].kwargs["Prefix"] == ""
     # list_refs scopes server-side to the refs/ subtree ("<prefix>/refs"); for a
     # bucket-root repo (prefix=="") that is "/refs". Bundle keys for such a repo are written as
     # f"{prefix}/{ref}/..." = "/refs/...", carrying that same leading slash, so "/refs" still
     # matches them correctly -- this is unchanged behavior, not a quirk introduced by scoping.
-    assert calls[1].kwargs["Prefix"] == "/refs"
+    assert [c.kwargs["Prefix"] for c in calls] == ["/refs"]
     assert refs == [f"refs/heads/{BRANCH}/{SHA1}.bundle"]
 
 
@@ -189,10 +188,10 @@ def test_cmd_list_nested_prefix(session_client_mock, stdout_mock):
             },
         ]
     }
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "nested/test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
     s3_remote.cmd_list()
     assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
@@ -211,10 +210,10 @@ def test_cmd_list_no_head(session_client_mock, stdout_mock):
         raise botocore.exceptions.ClientError({"Error": {"Code": "NoSuchKey"}}, "get_object")
 
     session_client_mock.return_value.get_object.side_effect = error
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     s3_remote.cmd_list()
     assert f"{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
 
@@ -226,10 +225,10 @@ def test_cmd_list_with_head_not_exsting_ref(session_client_mock, stdout_mock):
 
     session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA1])
     session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/master")}
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     s3_remote.cmd_list()
     assert f"{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
 
@@ -244,10 +243,10 @@ def test_cmd_list_protected_branch(session_client_mock, stdout_mock):
     )
 
     session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
-    session_client_mock.assert_any_call("s3")
     assert s3_remote.bucket == "test_bucket"
     assert s3_remote.prefix == "test_prefix"
     assert s3_remote.s3 == session_client_mock.return_value
+    session_client_mock.assert_any_call("s3")
     s3_remote.cmd_list()
     assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
 
@@ -1044,6 +1043,7 @@ def test_bundle_quiet_wins_over_progress(run_mock):
 
 @patch("git_remote_s3.git.subprocess.run")
 def test_unbundle_progress_flag(run_mock):
+    run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0)
     git.unbundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}", progress=True)
     assert run_mock.call_args[0][0][:4] == ["git", "bundle", "unbundle", "--progress"]
 
@@ -1630,3 +1630,314 @@ def test_process_cmd_clears_cas_and_protected_cache_after_push_batch(session_cli
 
     assert s3_remote.cas_refs == {}
     assert s3_remote._protected_cache == {}
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_option_cas_records_an_expect_absent_lease(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+
+    # git spells "the ref must not exist" as an all-zero sha; an empty value means the same.
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{NULL_SHA}")
+    s3_remote.cmd_option("option cas refs/heads/other:")
+
+    assert stdout_mock.getvalue() == "ok\nok\n"
+    assert s3_remote.cas_refs == {f"refs/heads/{BRANCH}": "", "refs/heads/other": ""}
+
+
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_lease_rejected_even_when_fast_forward(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA2])
+    # The ref moved after `list for-push`, but to a tip our push still fast-forwards from: the
+    # lease has to be enforced independently of the ancestry check.
+    is_ancestor_mock.return_value = True
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{MOVED_SHA}")
+    res = s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}")
+
+    assert res.startswith(f"error refs/heads/{BRANCH} ")
+    assert "stale info" in res
+    assert session_client_mock.return_value.upload_file.call_count == 0
+    bundle_mock.assert_not_called()
+
+
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_lease_expecting_absent_rejects_an_existing_ref(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA2])
+    is_ancestor_mock.return_value = True
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{NULL_SHA}")
+    res = s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}")
+
+    assert "stale info" in res
+    assert "absent" in res
+    assert session_client_mock.return_value.upload_file.call_count == 0
+    bundle_mock.assert_not_called()
+
+
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_lease_naming_a_sha_rejects_an_absent_ref(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[])
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{SHA2}")
+    res = s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}")
+
+    assert "stale info" in res
+    assert "absent" in res
+    assert session_client_mock.return_value.upload_file.call_count == 0
+    bundle_mock.assert_not_called()
+
+
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_lease_expecting_absent_accepts_a_new_ref(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    temp_dir = tempfile.mkdtemp("test_temp")
+    temp_file = tempfile.NamedTemporaryFile(dir=temp_dir, suffix=BUNDLE_SUFFIX)
+    with open(temp_file.name, "wb") as f:
+        f.write(MOCK_BUNDLE_CONTENT)
+    bundle_mock.return_value = temp_file.name
+    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[])
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{NULL_SHA}")
+    res = s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}")
+
+    assert res == f"ok refs/heads/{BRANCH}\n"
+    assert session_client_mock.return_value.upload_file.call_count == 1
+
+
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_lease_is_re_checked_under_the_lock(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    is_ancestor_mock.return_value = True
+    ref_prefix = f"test_prefix/refs/heads/{BRANCH}/"
+    # Another client committed a bundle between our pre-lock snapshot and the lock acquisition.
+    views = [
+        [],
+        [{"Key": f"{ref_prefix}{SHA2}.bundle", "LastModified": datetime.datetime.now()}],
+    ]
+
+    def list_objects_v2(Prefix, **kwargs):
+        if Prefix != ref_prefix:
+            return {"Contents": []}
+        return {"Contents": views.pop(0) if len(views) > 1 else views[0]}
+
+    session_client_mock.return_value.list_objects_v2.side_effect = list_objects_v2
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{NULL_SHA}")
+    res = s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}")
+
+    assert "stale info" in res
+    assert session_client_mock.return_value.upload_file.call_count == 0
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_push_batch_survives_a_bundle_failure(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock, stdout_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    session_client_mock.return_value.list_objects_v2.return_value = {"Contents": []}
+    temp_dir = tempfile.mkdtemp("test_temp")
+    temp_file = tempfile.NamedTemporaryFile(dir=temp_dir, suffix=BUNDLE_SUFFIX)
+    with open(temp_file.name, "wb") as f:
+        f.write(MOCK_BUNDLE_CONTENT)
+    bundle_mock.side_effect = [
+        git.GitError('fatal: bad object\nnot "ok"\n'),
+        temp_file.name,
+    ]
+
+    s3_remote.process_cmd(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}\n")
+    s3_remote.process_cmd("push refs/heads/other:refs/heads/other\n")
+    s3_remote.process_cmd("\n")
+
+    failed, succeeded = stdout_mock.getvalue().splitlines()[:2]
+    # git's stderr has to be flattened onto one line, with no bare quote to end the message early.
+    assert failed == f"""error refs/heads/{BRANCH} "fatal: bad object not 'ok'"?"""
+    assert succeeded == "ok refs/heads/other"
+    assert session_client_mock.return_value.upload_file.call_count == 1
+
+
+@patch("git_remote_s3.git.unbundle")
+@patch("boto3.Session.client")
+def test_process_fetch_cmds_raises_the_first_failure_after_the_batch(session_client_mock, unbundle_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+
+    def download_file(*, Key, **kwargs):
+        if SHA2 in Key:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+
+    session_client_mock.return_value.download_file.side_effect = download_file
+
+    with pytest.raises(NotAuthorizedError):
+        s3_remote.process_fetch_cmds(
+            [
+                f"fetch {SHA1} refs/heads/{BRANCH}",
+                f"fetch {SHA2} refs/heads/other",
+                f"fetch {MOVED_SHA} refs/heads/third",
+            ]
+        )
+
+    # The healthy fetches are not cancelled; only the batch's verdict changes.
+    assert SHA1 in s3_remote.fetched_refs
+    assert MOVED_SHA in s3_remote.fetched_refs
+    assert SHA2 not in s3_remote.fetched_refs
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_option_bad_verbosity_leaves_the_level_alone(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+
+    s3_remote.cmd_option("option verbosity 0")
+    s3_remote.cmd_option("option verbosity notanint")
+
+    assert s3_remote.verbosity == 0
+    assert stdout_mock.getvalue() == "ok\nunsupported\n"
+
+
+@patch("git_remote_s3.git.is_shallow_repository")
+@patch("git_remote_s3.git.is_ancestor")
+@patch("git_remote_s3.git.rev_parse")
+@patch("git_remote_s3.git.bundle")
+@patch("boto3.Session.client")
+def test_cmd_push_probes_shallowness_once_per_process(
+    session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock, is_shallow_repository_mock
+):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    rev_parse_mock.return_value = SHA1
+    is_shallow_repository_mock.return_value = False
+    session_client_mock.return_value.list_objects_v2.return_value = {"Contents": []}
+    temp_dir = tempfile.mkdtemp("test_temp")
+    temp_file = tempfile.NamedTemporaryFile(dir=temp_dir, suffix=BUNDLE_SUFFIX)
+    with open(temp_file.name, "wb") as f:
+        f.write(MOCK_BUNDLE_CONTENT)
+    bundle_mock.return_value = temp_file.name
+
+    assert s3_remote.cmd_push(f"push refs/heads/{BRANCH}:refs/heads/{BRANCH}").startswith("ok")
+    assert s3_remote.cmd_push("push refs/heads/other:refs/heads/other").startswith("ok")
+
+    is_shallow_repository_mock.assert_called_once_with()
+
+
+@patch("git_remote_s3.remote.time.monotonic")
+@patch("sys.stderr", new_callable=StringIO)
+def test_transfer_progress_throttles_rapid_updates(stderr_mock, monotonic_mock):
+    monotonic_mock.side_effect = [0.0, 0.01, 0.02, 0.03, 0.2, 0.21]
+    progress = TransferProgress(action="Downloading", label="refs/heads/main")
+
+    for _ in range(6):
+        progress(1024)
+
+    # The first update always renders; after that only one per throttle window gets through.
+    assert stderr_mock.getvalue().count("\r") == 2
+
+
+@patch("sys.stderr", new_callable=StringIO)
+def test_transfer_progress_close_newlines_only_after_a_render(stderr_mock):
+    progress = TransferProgress(action="Downloading", label="refs/heads/main")
+
+    progress.close()
+    assert stderr_mock.getvalue() == ""
+
+    progress(1024)
+    progress.close()
+    assert stderr_mock.getvalue().endswith("\n")
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_push_delete_with_matching_lease_proceeds(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    session_client_mock.return_value.list_objects_v2.return_value = {
+        "Contents": [
+            {
+                "Key": f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
+                "LastModified": datetime.datetime.now(),
+            }
+        ]
+    }
+
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{SHA1}")
+    res = s3_remote.cmd_push(f"push :refs/heads/{BRANCH}")
+
+    assert res == f"ok refs/heads/{BRANCH}\n"
+    assert session_client_mock.return_value.delete_object.call_count == 1
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_push_delete_with_stale_lease_deletes_nothing(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    session_client_mock.return_value.list_objects_v2.return_value = {
+        "Contents": [
+            {
+                "Key": f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
+                "LastModified": datetime.datetime.now(),
+            }
+        ]
+    }
+
+    # The ref moved after `list for-push`; a delete replaces history just as a force push does.
+    s3_remote.cmd_option(f"option cas refs/heads/{BRANCH}:{MOVED_SHA}")
+    res = s3_remote.cmd_push(f"push :refs/heads/{BRANCH}")
+
+    assert res.startswith(f"error refs/heads/{BRANCH} ")
+    assert "stale info" in res
+    session_client_mock.return_value.delete_object.assert_not_called()
+
+
+@patch("boto3.Session.client")
+def test_cmd_push_delete_without_a_lease_is_unchanged(session_client_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    session_client_mock.return_value.list_objects_v2.return_value = {
+        "Contents": [
+            {
+                "Key": f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
+                "LastModified": datetime.datetime.now(),
+            }
+        ]
+    }
+
+    res = s3_remote.cmd_push(f"push :refs/heads/{BRANCH}")
+
+    assert res == f"ok refs/heads/{BRANCH}\n"
+    assert session_client_mock.return_value.delete_object.call_count == 1
+    # An unleased delete must not pay for the lease probe's extra listing.
+    assert session_client_mock.return_value.list_objects_v2.call_count == 1
