@@ -11,6 +11,10 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
 - Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
+- Pushing from a shallow clone is rejected with a clear error telling you to run `git fetch --unshallow` first, instead of silently uploading a truncated bundle
+- Partial clones (`git clone --filter=blob:none` / `--filter=tree:0`) are fully supported for push and fetch
+- Push and fetch render live transfer progress on the terminal, honoring `git push --quiet` / `--progress`
+- `--force-with-lease` is supported with real compare-and-swap semantics against the remote ref, not just a `+` force push
 
 Not affiliated with or endorsed by Amazon Web Services.
 
@@ -85,7 +89,7 @@ Before you can use `git-remote-s3`, you must:
       {
         "Sid": "S3ObjectAccess",
         "Effect": "Allow",
-        "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+        "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
         "Resource": ["arn:aws:s3:::<BUCKET>/*"]
       },
       {
@@ -136,7 +140,8 @@ If you store multiple repos in a single bucket but would like to separate permis
         "Action": [
           "s3:PutObject",
           "s3:GetObject",
-          "s3:DeleteObject"
+          "s3:DeleteObject",
+          "s3:AbortMultipartUpload"
         ],
         "Resource": ["arn:aws:s3:::<BUCKET>/<REPO>/*"]
       },
@@ -429,7 +434,7 @@ run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale loc
 
 #### Lock timeout and cleanup
 
-- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable)
+- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable)
 - **Stale lock detection**: If a lock becomes stale (older than the TTL), it can be automatically replaced during lock acquisition
 - **Manual cleanup**: Use `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally clean up stale locks
 
@@ -456,7 +461,7 @@ Another client may be pushing. If this persists beyond 60s,
 run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
 ```
 
-The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable
+The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable
 If for some reason a reference's lock becomes stale, `git-remote-s3` automatically clears it when executing a git push.
 If you repeatedly run into lock acquisition failures or otherwise want to manually clean up stale locks, run `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally remove those stale locks.
 

@@ -114,18 +114,32 @@ class LFSProcess:
         register_s3_access_grants(s3.meta.client, session)
         self.s3_bucket = s3.Bucket(self.bucket)
 
+    def _lfs_object_exists(self, key: str) -> bool:
+        client = self.s3_bucket.meta.client
+        try:
+            client.head_object(Bucket=self.s3_bucket.name, Key=key)
+            return True
+        except client.exceptions.ClientError as e:
+            # HeadObject has no XML error body to parse a semantic code from, so botocore
+            # falls back to the raw HTTP status code as the error Code; "NoSuchKey" is never
+            # raised here (unlike GetObject).
+            if e.response.get("Error", {}).get("Code") == "404":
+                return False
+            raise
+
     def upload(self, event: dict):
         logger.debug("upload")
         try:
             self.init_s3_bucket()
-            if list(self.s3_bucket.objects.filter(Prefix=f"{self.prefix}/lfs/{event['oid']}")):
+            key = f"{self.prefix}/lfs/{event['oid']}"
+            if self._lfs_object_exists(key):
                 logger.debug("object already exists")
                 sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")
                 sys.stdout.flush()
                 return
             self.s3_bucket.upload_file(
                 event["path"],
-                f"{self.prefix}/lfs/{event['oid']}",
+                key,
                 Callback=ProgressPercentage(event["oid"]),
             )
             sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")

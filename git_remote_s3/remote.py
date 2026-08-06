@@ -17,6 +17,7 @@ from botocore.exceptions import (
 )
 from boto3.s3.transfer import TransferConfig
 import re
+import shutil
 import subprocess
 import tempfile
 import os
@@ -53,6 +54,67 @@ if "remote" in __name__:
     )
 
 DEFAULT_LOCK_TTL_SECONDS = 60
+
+_KB = 1024
+_MB = 1024**2
+
+# 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
+# 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling.
+_TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=25 * _MB,
+    multipart_chunksize=16 * _MB,
+    use_threads=True,
+    max_concurrency=8,
+)
+
+
+class TransferProgress:
+    """Renders S3 transfer progress on stderr, which git leaves attached to the user's terminal.
+
+    boto3 invokes the callback from several transfer threads under multipart, so both the counter
+    and the write have to be serialised.
+    """
+
+    def __init__(self, *, action: str, label: str, total_bytes: int | None = None):
+        self.action = action
+        self.label = label
+        self.total_bytes = total_bytes
+        self._seen_so_far = 0
+        self._lock = Lock()
+        self._rendered = False
+
+    def __call__(self, bytes_amount: int) -> None:
+        with self._lock:
+            self._seen_so_far += bytes_amount
+            if self.total_bytes:
+                pct = min(100, int(self._seen_so_far * 100 / self.total_bytes))
+                unit, divisor, decimals = self._unit_for(self.total_bytes)
+                seen_disp = self._seen_so_far / divisor
+                total_disp = self.total_bytes / divisor
+                sys.stderr.write(
+                    f"\r{self.action} {self.label}: {seen_disp:.{decimals}f} / {total_disp:.{decimals}f} "
+                    f"{unit} ({pct}%)"
+                )
+            else:
+                unit, divisor, decimals = self._unit_for(self._seen_so_far)
+                seen_disp = self._seen_so_far / divisor
+                sys.stderr.write(f"\r{self.action} {self.label}: {seen_disp:.{decimals}f} {unit}")
+            sys.stderr.flush()
+            self._rendered = True
+
+    @staticmethod
+    def _unit_for(reference_bytes: int) -> tuple[str, int, int]:
+        """Picks the display unit off the given byte count: KiB below 1 MiB, MiB at or above."""
+        if reference_bytes < _MB:
+            return "KiB", _KB, 0
+        return "MiB", _MB, 1
+
+    def close(self) -> None:
+        with self._lock:
+            if self._rendered:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+                self._rendered = False
 
 
 class BucketNotFoundError(Exception):
@@ -145,10 +207,15 @@ class S3Remote:
 
         self.bucket = bucket
         self.mode = None
+        self.progress = False
+        self.verbosity = 1
         self.fetched_refs = []
         self.fetched_refs_lock = Lock()  # Lock for thread-safe access to fetched_refs
         self.push_cmds = []
         self.fetch_cmds = []  # Store fetch commands for batch processing
+        # <remote ref> -> sha git leased the ref against, from `option cas` (--force-with-lease).
+        self.cas_refs: dict[str, str] = {}
+        self._protected_cache: dict[str, list] = {}
         # Lock TTL (seconds); can be configured via env var
         try:
             self.lock_ttl_seconds = int(os.environ.get("GIT_REMOTE_S3_LOCK_TTL_SECONDS", DEFAULT_LOCK_TTL_SECONDS))
@@ -161,9 +228,15 @@ class S3Remote:
             maybe_install_lfs_agent(remote_name)
 
     def list_refs(self, *, bucket: str, prefix: str) -> list:
-        # Scoped to exactly this repo (see __init__); filtering below still
-        # uses the bare prefix, so results are unchanged.
-        list_prefix = scoped_list_prefix(prefix)
+        # Scoped to the refs/ subtree server-side: in an LFS-heavy repo the
+        # "lfs/<oid>" keys vastly outnumber refs, so listing the bare repo
+        # prefix (see __init__'s existence-check probe, which does need the
+        # bare prefix) would paginate through every LFS object on every push
+        # and fetch. For a bucket-root repo (prefix == "") this scopes to
+        # "/refs"; keys there are written as f"{prefix}/{ref}/..." = "/refs/...",
+        # carrying that same leading slash, so the scoped prefix still matches
+        # them exactly as the bare-prefix filter below always did.
+        list_prefix = f"{prefix}/refs"
         res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix)
         contents = res.get("Contents", [])
         next_token = res.get("NextContinuationToken", None)
@@ -183,7 +256,30 @@ class S3Remote:
         ]
         return objs
 
-    def cmd_fetch(self, args: str):
+    @contextlib.contextmanager
+    def transfer_progress(self, *, action: str, label: str, total_bytes: int | None = None, show_progress: bool = True):
+        """Yields a boto3 transfer Callback, or None when git did not ask for progress."""
+        progress = (
+            TransferProgress(action=action, label=label, total_bytes=total_bytes)
+            if self.progress and show_progress
+            else None
+        )
+        try:
+            yield progress
+        finally:
+            if progress is not None:
+                progress.close()
+
+    def cmd_fetch(self, args: str, *, show_progress: bool = True):
+        """Fetches a single ref's bundle and unbundles it.
+
+        Args:
+            args (str): the `fetch <sha> <ref>` command line from git
+            show_progress (bool): render this fetch's transfer progress. Multiple concurrent
+                fetches would otherwise interleave their own `\\r`-updating meters (both the S3
+                download callback and `git bundle unbundle --progress`) into garbled output, so
+                process_fetch_cmds disables it for every fetch in a multi-ref batch.
+        """
         sha, ref = args.split(" ")[1:]
         with self.fetched_refs_lock:
             if sha in self.fetched_refs:
@@ -194,35 +290,20 @@ class S3Remote:
             temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_fetch_")
             bundle_path = f"{temp_dir}/{sha}.bundle"
 
-            # Use TransferConfig for multipart download
-            # Multipart Threshold (64 MB):
-            # - Small enough to ensure multi-part downloads are used when necessary
-            # - Allows parallel downloading to begin early
-            # - Good balance between overhead and parallelization benefits
-            # Chunk Size (16 MB):
-            # - Large enough to minimize HTTP request overhead
-            # - Small enough to allow good parallelization (500 MB file = ~31 chunks)
-            # - Provides reasonable progress granularity for monitoring
-            # - Works well with typical network conditions
-            MB = 1024**2
-            config = TransferConfig(
-                multipart_threshold=25 * MB,  # 25MB threshold for multipart
-                multipart_chunksize=16 * MB,  # Size of each part
-                use_threads=True,  # Enable threading
-                max_concurrency=8,  # Number of concurrent threads
-            )
-
-            # Download file using the TransferConfig
-            self.s3.download_file(
-                Bucket=self.bucket,
-                Key=f"{self.prefix}/{ref}/{sha}.bundle",
-                Filename=bundle_path,
-                Config=config,
-            )
+            # The object size is unknown before the transfer starts, so the renderer reports
+            # bytes transferred without a percentage rather than paying for a head_object.
+            with self.transfer_progress(action="Downloading", label=ref, show_progress=show_progress) as progress:
+                self.s3.download_file(
+                    Bucket=self.bucket,
+                    Key=f"{self.prefix}/{ref}/{sha}.bundle",
+                    Filename=bundle_path,
+                    Config=_TRANSFER_CONFIG,
+                    Callback=progress,
+                )
 
             logger.info(f"fetched {bundle_path} {ref}")
 
-            git.unbundle(folder=temp_dir, sha=sha, ref=ref)
+            git.unbundle(folder=temp_dir, sha=sha, ref=ref, progress=self.progress and show_progress)
             with self.fetched_refs_lock:
                 self.fetched_refs.append(sha)
         except ClientError as e:
@@ -230,8 +311,8 @@ class S3Remote:
                 raise NotAuthorizedError("GetObject", self.bucket) from e
             raise e
         finally:
-            if temp_dir is not None and os.path.exists(f"{temp_dir}/{sha}.bundle"):
-                os.remove(f"{temp_dir}/{sha}.bundle")
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def remove_remote_ref(self, remote_ref: str) -> str:
         logger.info(f"Removing remote ref {remote_ref}")
@@ -265,16 +346,23 @@ class S3Remote:
         if not local_ref:
             return self.remove_remote_ref(remote_ref)
         if local_ref.startswith("+"):
-            force_push = not self.is_protected(remote_ref)
+            force_push = True
             logger.info(f"Force push {force_push}")
             local_ref = local_ref[1:]
 
         logger.info(f"push !{local_ref}! !{remote_ref}!")
-        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
+
+        # `git bundle create` in a shallow repo emits a bundle with truncated history and no
+        # prerequisites that `git bundle verify` still calls complete, so the breakage would only
+        # surface for whoever clones it next.
+        if git.is_shallow_repository():
+            return f'error {remote_ref} "cannot push from a shallow clone; run git fetch --unshallow first."?\n'
 
         contents = self.get_bundles_for_ref(remote_ref)
         if len(contents) > 1:
             return f'error {remote_ref} "multiple bundles exists on server. Run git-s3 doctor to fix."?\n'  # noqa: B950
+
+        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
 
         # Best-effort fast-fail on a non-fast-forward push before we create the bundle and take the
         # lock. This is only an optimization; the authoritative reconcile happens under the lock
@@ -288,11 +376,24 @@ class S3Remote:
             sha = git.rev_parse(local_ref)
             if pre_lock_bundle:
                 remote_sha = pre_lock_bundle.split("/")[-1].split(".")[0]
-                if not force_push and not git.is_ancestor(remote_sha, sha):
-                    return f'error {remote_ref} "remote ref is not ancestor of {local_ref}."?\n'
+                if not git.is_ancestor(remote_sha, sha):
+                    error = self.non_fast_forward_error(
+                        remote_ref=remote_ref,
+                        local_ref=local_ref,
+                        remote_sha=remote_sha,
+                        force_push=force_push,
+                    )
+                    if error:
+                        return error
 
             # Create the bundle before acquiring the lock (local operation)
-            temp_file = git.bundle(folder=temp_dir, sha=sha, ref=local_ref)
+            temp_file = git.bundle(
+                folder=temp_dir,
+                sha=sha,
+                ref=local_ref,
+                progress=self.progress,
+                quiet=self.verbosity == 0,
+            )
 
             # Acquire per-ref lock to avoid concurrent writes
             lock_key = self.acquire_lock(remote_ref)
@@ -322,36 +423,68 @@ class S3Remote:
             remote_to_remove = current_contents[0]["Key"] if len(current_contents) == 1 else None
             if remote_to_remove is not None:
                 remote_sha = remote_to_remove.split("/")[-1].split(".")[0]
-                if not force_push and not git.is_ancestor(remote_sha, sha):
-                    return f'error {remote_ref} "remote ref is not ancestor of {local_ref}."?\n'
+                if not git.is_ancestor(remote_sha, sha):
+                    error = self.non_fast_forward_error(
+                        remote_ref=remote_ref,
+                        local_ref=local_ref,
+                        remote_sha=remote_sha,
+                        force_push=force_push,
+                    )
+                    if error:
+                        return error
 
-            with open(temp_file, "rb") as f:
-                self.s3.put_object(
+            with self.transfer_progress(
+                action="Uploading",
+                label=remote_ref,
+                total_bytes=os.path.getsize(temp_file),
+            ) as progress:
+                self.s3.upload_file(
+                    Filename=temp_file,
                     Bucket=self.bucket,
                     Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
-                    Body=f,
+                    Config=_TRANSFER_CONFIG,
+                    Callback=progress,
                 )
 
-            self.init_remote_head(remote_ref)
-            logger.info(f"pushed {temp_file} to {remote_ref}")
+            # init_remote_head (a HeadObject + maybe PutObject) and removing the stale bundle
+            # are independent of each other, so run them concurrently. Both futures are waited
+            # on before either result is consulted, so a delete failure is never silently
+            # dropped just because the HEAD-init result was checked first; checking
+            # head_future first preserves the same error-priority the sequential code had.
             if remote_to_remove:
-                self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    head_future = executor.submit(self.init_remote_head, remote_ref)
+                    delete_future = executor.submit(self.s3.delete_object, Bucket=self.bucket, Key=remote_to_remove)
+                    concurrent.futures.wait([head_future, delete_future])
+                    head_future.result()
+                    delete_future.result()
+            else:
+                self.init_remote_head(remote_ref)
+            logger.info(f"pushed {temp_file} to {remote_ref}")
 
             if self.uri_scheme == UriScheme.S3_ZIP:
                 # Create and push a zip archive next to the bundle file
                 # Example use-case: Repo on S3 as Source for AWS CodePipeline
                 commit_msg = git.get_last_commit_message()
                 temp_file_archive = git.archive(folder=temp_dir, ref=local_ref)
-                with open(temp_file_archive, "rb") as f:
-                    self.s3.put_object(
+                with self.transfer_progress(
+                    action="Uploading",
+                    label=f"{remote_ref} (zip)",
+                    total_bytes=os.path.getsize(temp_file_archive),
+                ) as progress:
+                    self.s3.upload_file(
+                        Filename=temp_file_archive,
                         Bucket=self.bucket,
                         Key=f"{self.prefix}/{remote_ref}/repo.zip",
-                        Body=f,
-                        Metadata={"codepipeline-artifact-revision-summary": commit_msg},
-                        ContentDisposition=f"attachment; filename=repo-{sha[:8]}.zip",
+                        ExtraArgs={
+                            "Metadata": {"codepipeline-artifact-revision-summary": commit_msg},
+                            "ContentDisposition": f"attachment; filename=repo-{sha[:8]}.zip",
+                        },
+                        Config=_TRANSFER_CONFIG,
+                        Callback=progress,
                     )
                 logger.info(
-                    f"pushed {temp_file_archive} to " + "{self.prefix}/{remote_ref}/repo.zip with message {commit_msg}"
+                    f"pushed {temp_file_archive} to {self.prefix}/{remote_ref}/repo.zip with message {commit_msg}"
                 )
 
             result = f"ok {remote_ref}\n"
@@ -375,8 +508,7 @@ class S3Remote:
                         f"manually remove the lock {lock_key} from the server or use "
                         f'git-s3 doctor to fix."?\n'
                     )
-            if sha and os.path.exists(f"{temp_dir}/{sha}.bundle"):
-                os.remove(f"{temp_dir}/{sha}.bundle")
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         return lock_release_error if lock_release_error else result
 
@@ -420,10 +552,40 @@ class S3Remote:
         ]
 
     def is_protected(self, remote_ref):
-        protected = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/PROTECTED#").get(
-            "Contents", []
-        )
-        return protected
+        # cmd_push consults this on the pre-lock fast-fail and again under the lock; protection is
+        # set out of band by an admin, so one ListObjectsV2 per ref per process is enough.
+        if remote_ref not in self._protected_cache:
+            self._protected_cache[remote_ref] = self.s3.list_objects_v2(
+                Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/PROTECTED#"
+            ).get("Contents", [])
+        return self._protected_cache[remote_ref]
+
+    def non_fast_forward_error(
+        self, *, remote_ref: str, local_ref: str, remote_sha: str, force_push: bool
+    ) -> str | None:
+        """Authorises replacing a remote sha that is not an ancestor of what is being pushed.
+
+        Callers must only reach here for a genuinely non-fast-forward update, since the protection
+        check costs an S3 round trip.
+
+        Returns:
+            str | None: the error line to send back to git, or None when the update may proceed
+        """
+        if not force_push:
+            leased_sha = self.cas_refs.get(remote_ref)
+            if leased_sha is None:
+                return f'error {remote_ref} "remote ref is not ancestor of {local_ref}."?\n'
+            if leased_sha != remote_sha:
+                return (
+                    f'error {remote_ref} "stale info: remote ref is at {remote_sha}, not the '
+                    f'{leased_sha} it was leased against. Fetch first."?\n'
+                )
+
+        # A lease-approved update replaces history just as a `+` push does, so both answer to the
+        # protected marker.
+        if self.is_protected(remote_ref):
+            return f'error {remote_ref} "remote ref is protected."?\n'
+        return None
 
     def acquire_lock(self, remote_ref: str) -> str | None:
         """Acquire a per-ref lock using S3 conditional writes.
@@ -491,14 +653,36 @@ class S3Remote:
                 raise
 
     def cmd_option(self, arg: str):
-        option, value = arg.split(" ")[1:]
-        if option == "verbosity" and int(value) >= 2:
-            # Set both root logger and module logger for complete verbosity
-            logging.getLogger().setLevel(logging.INFO)
-            logger.setLevel(logging.INFO)
-            sys.stdout.write("ok\n")
-        else:
-            sys.stdout.write("unsupported\n")
+        parts = arg.strip().split(" ")
+        option = parts[1] if len(parts) > 1 else ""
+        value = " ".join(parts[2:])
+        answer = "unsupported\n"
+
+        if option == "progress":
+            self.progress = value.lower() == "true"
+            answer = "ok\n"
+        elif option == "cas":
+            # git sends `option cas <ref>:<sha>` per ref of a --force-with-lease push, after
+            # `list for-push` and before the push line, and the push line carries no leading `+`.
+            ref, _, expected_sha = value.rpartition(":")
+            if ref and expected_sha:
+                self.cas_refs[ref] = expected_sha
+            answer = "ok\n"
+        elif option == "verbosity":
+            try:
+                self.verbosity = int(value)
+            except ValueError:
+                self.verbosity = 1
+            else:
+                # Only ever raises the level, so GIT_REMOTE_S3_VERBOSE keeps winning over
+                # the default verbosity git sends on every invocation.
+                if self.verbosity >= 2:
+                    # Set both root logger and module logger for complete verbosity
+                    logging.getLogger().setLevel(logging.INFO)
+                    logger.setLevel(logging.INFO)
+                answer = "ok\n"
+
+        sys.stdout.write(answer)
         sys.stdout.flush()
 
     def cmd_list(self, *, for_push: bool = False):
@@ -556,10 +740,15 @@ class S3Remote:
 
         logger.info(f"Processing {len(cmds)} fetch commands in parallel")
 
+        # Two or more concurrent fetches each render their own progress meter to the shared
+        # stderr, which garbles into unreadable output, so progress is only shown when there is
+        # exactly one fetch in the batch.
+        show_progress = len(cmds) == 1
+
         # Use a thread pool to process fetch commands in parallel
         with concurrent.futures.ThreadPoolExecutor() as executor:
             # Submit all fetch commands to the thread pool
-            futures = [executor.submit(self.cmd_fetch, cmd) for cmd in cmds]
+            futures = [executor.submit(self.cmd_fetch, cmd, show_progress=show_progress) for cmd in cmds]
 
             # Wait for all fetch commands to complete
             concurrent.futures.wait(futures)
@@ -595,6 +784,10 @@ class S3Remote:
                 for res in push_res:
                     sys.stdout.write(res)
                 self.push_cmds = []
+                # git sends one batch per invocation today, but the protocol permits several; a
+                # stale lease or protection verdict must not leak into a later batch.
+                self.cas_refs = {}
+                self._protected_cache = {}
             elif self.mode == Mode.FETCH and self.fetch_cmds:
                 logger.info(f"fetching {len(self.fetch_cmds)} refs in parallel")
                 self.process_fetch_cmds(self.fetch_cmds)

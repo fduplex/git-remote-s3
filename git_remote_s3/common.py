@@ -302,6 +302,25 @@ def _detect_access_grants_fallback(**kwargs) -> None:
         _notify_access_grants_fallback()
 
 
+def _memoize_sts_caller_identity(plugin) -> None:
+    """Caches the plugin's STS ``get_caller_identity()`` call for the process lifetime.
+
+    ``S3AccessGrantsPlugin._get_access_grants_credentials`` calls
+    ``self.sts_client.get_caller_identity()`` on every ``before-sign.s3`` event — i.e. once per
+    S3 request, roughly 7-10 per push — without caching it itself. The caller's account id is
+    invariant for the process, so memoize it here instead. Feature-detected via getattr/callable
+    checks so a future plugin release that renames or drops ``sts_client`` degrades to a no-op
+    rather than crashing every push.
+    """
+    sts_client = getattr(plugin, "sts_client", None)
+    if sts_client is None:
+        return
+    get_caller_identity = getattr(sts_client, "get_caller_identity", None)
+    if not callable(get_caller_identity):
+        return
+    sts_client.get_caller_identity = functools.lru_cache(maxsize=1)(get_caller_identity)
+
+
 def register_s3_access_grants(s3_client, session):
     """Registers the AWS S3 Access Grants plugin on an S3 client and returns it.
 
@@ -328,6 +347,7 @@ def register_s3_access_grants(s3_client, session):
     """
     plugin = S3AccessGrantsPlugin(s3_client, fallback_enabled=True, customer_session=session._session)
     plugin.register()
+    _memoize_sts_caller_identity(plugin)
     s3_client.meta.events.register("before-sign.s3", _detect_access_grants_fallback)
     return s3_client
 
@@ -352,4 +372,5 @@ def register_s3_access_grants_strict(s3_client, session):
     """
     plugin = S3AccessGrantsPlugin(s3_client, fallback_enabled=False, customer_session=session._session)
     plugin.register()
+    _memoize_sts_caller_identity(plugin)
     return s3_client

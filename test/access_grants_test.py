@@ -48,6 +48,38 @@ def test_register_s3_access_grants_registers_plugin_with_fallback(plugin_cls):
 
 
 @patch("git_remote_s3.common.S3AccessGrantsPlugin")
+def test_register_s3_access_grants_memoizes_sts_caller_identity(plugin_cls):
+    # The plugin calls sts_client.get_caller_identity() uncached on every before-sign.s3
+    # event (i.e. every S3 request); simulate two such events firing and assert the real STS
+    # client is only hit once.
+    client = MagicMock()
+    session = MagicMock()
+    real_get_caller_identity = MagicMock(return_value={"Account": "123456789012"})
+    plugin_cls.return_value.sts_client = SimpleNamespace(get_caller_identity=real_get_caller_identity)
+
+    register_s3_access_grants(client, session)
+
+    first = plugin_cls.return_value.sts_client.get_caller_identity()
+    second = plugin_cls.return_value.sts_client.get_caller_identity()
+
+    assert first == second == {"Account": "123456789012"}
+    real_get_caller_identity.assert_called_once()
+
+
+@patch("git_remote_s3.common.S3AccessGrantsPlugin")
+def test_register_s3_access_grants_tolerates_missing_sts_client(plugin_cls):
+    # A future plugin release that renames or drops sts_client must degrade to a no-op
+    # instead of crashing every git push.
+    client = MagicMock()
+    session = MagicMock()
+    plugin_cls.return_value.sts_client = None
+
+    returned = register_s3_access_grants(client, session)
+
+    assert returned is client
+
+
+@patch("git_remote_s3.common.S3AccessGrantsPlugin")
 @patch("boto3.Session")
 def test_s3remote_registers_plugin_on_its_client(session_cls, plugin_cls):
     session = session_cls.return_value
