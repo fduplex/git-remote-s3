@@ -19,6 +19,7 @@ from .common import (
     s3_region_kwargs,
     synthetic_lfs_url,
     BucketAliasError,
+    TRANSFER_CONFIG,
 )
 from .git import validate_ref_name
 
@@ -145,6 +146,7 @@ class LFSProcess:
                 event["path"],
                 key,
                 Callback=ProgressPercentage(event["oid"]),
+                Config=TRANSFER_CONFIG,
             )
             sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")
         except Exception as e:
@@ -162,6 +164,7 @@ class LFSProcess:
                 Key=f"{self.prefix}/lfs/{event['oid']}",
                 Filename=f"{temp_dir}/{event['oid']}",
                 Callback=ProgressPercentage(event["oid"]),
+                Config=TRANSFER_CONFIG,
             )
             done_event = {
                 "event": "complete",

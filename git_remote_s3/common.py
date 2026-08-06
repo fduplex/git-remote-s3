@@ -14,8 +14,21 @@ import dns.resolver
 from aws_s3_access_grants_boto3_plugin.s3_access_grants_plugin import (
     S3AccessGrantsPlugin,
 )
+from boto3.s3.transfer import TransferConfig
 
 from .enums import UriScheme
+
+_MB = 1024**2
+
+# 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
+# 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling. Shared by
+# the bundle transfers in remote.py and the LFS object transfers in lfs.py.
+TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=25 * _MB,
+    multipart_chunksize=16 * _MB,
+    use_threads=True,
+    max_concurrency=8,
+)
 
 
 def parse_git_url(url: str | None) -> tuple[UriScheme | None, str | None, str | None, str | None]:

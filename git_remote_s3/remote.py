@@ -15,7 +15,6 @@ from botocore.exceptions import (
     NoCredentialsError,
     UnknownCredentialError,
 )
-from boto3.s3.transfer import TransferConfig
 import re
 import shutil
 import subprocess
@@ -35,6 +34,7 @@ from .common import (
     register_s3_access_grants,
     resolve_bucket_region,
     BucketAliasError,
+    TRANSFER_CONFIG,
 )
 import botocore
 import contextlib
@@ -71,15 +71,6 @@ _MB = 1024**2
 # Rendering on every boto3 chunk (256 KiB) from up to 8 transfer threads costs far more writes
 # than a terminal can show; a tenth of a second still reads as continuous motion.
 _PROGRESS_MIN_INTERVAL_S = 0.1
-
-# 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
-# 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling.
-_TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=25 * _MB,
-    multipart_chunksize=16 * _MB,
-    use_threads=True,
-    max_concurrency=8,
-)
 
 
 class TransferProgress:
@@ -418,7 +409,7 @@ class S3Remote:
                     Bucket=self.bucket,
                     Key=f"{self.prefix}/{ref}/{sha}.bundle",
                     Filename=bundle_path,
-                    Config=_TRANSFER_CONFIG,
+                    Config=TRANSFER_CONFIG,
                     Callback=progress,
                 )
 
@@ -571,7 +562,7 @@ class S3Remote:
                     Filename=temp_file,
                     Bucket=self.bucket,
                     Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
-                    Config=_TRANSFER_CONFIG,
+                    Config=TRANSFER_CONFIG,
                     Callback=progress,
                 )
 
@@ -609,7 +600,7 @@ class S3Remote:
                             "Metadata": {"codepipeline-artifact-revision-summary": commit_msg},
                             "ContentDisposition": f"attachment; filename=repo-{sha[:8]}.zip",
                         },
-                        Config=_TRANSFER_CONFIG,
+                        Config=TRANSFER_CONFIG,
                         Callback=progress,
                     )
                 logger.info(

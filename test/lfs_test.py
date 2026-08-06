@@ -11,6 +11,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import lfs
+from git_remote_s3.common import TRANSFER_CONFIG
 
 
 def test_resolve_git_dir_returns_absolute_path_in_repo():
@@ -123,9 +124,10 @@ def test_download_uses_resolved_gitdir_for_temp_dir(
     proc.s3_bucket = SimpleNamespace()
     captured = {}
 
-    def fake_download_file(Key, Filename, Callback):
+    def fake_download_file(Key, Filename, Callback, Config):
         captured["Key"] = Key
         captured["Filename"] = Filename
+        captured["Config"] = Config
 
     proc.s3_bucket.download_file = fake_download_file
     proc.init_s3_bucket = lambda: None
@@ -135,6 +137,7 @@ def test_download_uses_resolved_gitdir_for_temp_dir(
 
     expected_dir = "/resolved/.git/modules/sub/lfs/tmp"
     assert captured["Filename"] == f"{expected_dir}/abc123"
+    assert captured["Config"] is TRANSFER_CONFIG
     makedirs_mock.assert_called_once_with(expected_dir, exist_ok=True)
 
 
@@ -188,6 +191,7 @@ def test_upload_proceeds_when_head_object_reports_not_found(code):
 
     bucket.upload_file.assert_called_once()
     assert bucket.upload_file.call_args.args[:2] == ("/tmp/whatever", "test_prefix/lfs/abc123")
+    assert bucket.upload_file.call_args.kwargs["Config"] is TRANSFER_CONFIG
     event = json.loads(stdout.getvalue().strip())
     assert event == {"event": "complete", "oid": "abc123"}
 
