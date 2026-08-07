@@ -128,6 +128,19 @@ def test_lfsurl_preserves_dns_bucket_alias(temp_git_repo):
     assert _config_get(f"lfs.{expected}.standalonetransferagent") == "git-lfs-s3"
 
 
+def test_lfsurl_percent_encodes_reserved_chars_in_prefix(temp_git_repo):
+    """git-lfs resolves an unencoded '%' endpoint as <unknown>, so the auto-installer must write
+    the encoded URL into both keys — they only pair up if they are byte-identical."""
+    _add_remote("nasty", "s3://my-bucket/deep dir/repo%zz")
+    expected = synthetic_lfs_url("my-bucket", "deep dir/repo%zz")
+    assert expected.endswith("/my-bucket/deep%20dir/repo%25zz")
+
+    maybe_install_lfs_agent("nasty")
+
+    assert _config_get_all("remote.nasty.lfsurl") == [expected]
+    assert _config_get_all(f"lfs.{expected}.standalonetransferagent") == ["git-lfs-s3"]
+
+
 @pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "No"])
 def test_opt_out_env_var_skips_install(temp_git_repo, monkeypatch, value):
     _add_remote("origin", S3_URL)

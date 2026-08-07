@@ -381,6 +381,14 @@ The `lfs-alias.git-remote-s3.test` host is a synthetic, never-contacted match ke
 
 `<bucket>` in that URL is the bucket component of the remote URL verbatim: when the remote uses a DNS bucket alias (e.g. `s3://demos.git.example.com/my-repo`), the alias — not the resolved bucket name — is written into the config, so re-pointing the alias at a different bucket never invalidates existing checkouts. Re-running `git-lfs-s3 install --remote <name>` migrates configs written by older versions that rendered the resolved bucket name.
 
+`lfs.customtransfer.git-lfs-s3.path` is necessarily repo-wide (git-lfs registers transfer adapters globally, not per URL), so `git-lfs-s3` is still listed in the `transfers` array of batch requests sent to other LFS servers. If a server rejects requests naming unknown adapters, set:
+
+```bash
+git config lfs.basictransfersonly true
+```
+
+which makes git-lfs omit the `transfers` array entirely. This setting is repo-wide and limits other remotes to basic HTTPS transfers; GitHub-style hosts already use these (even over SSH remotes), so only the rare server that speaks exclusively the pure-SSH LFS protocol is affected.
+
 ### Creating the repo and pushing
 
 Let's assume we want to store TIFF file in LFS.
