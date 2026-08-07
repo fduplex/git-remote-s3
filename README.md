@@ -7,7 +7,7 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 
 - Fix for LFS temp-file paths when the repo is used as a submodule
 - Per-remote LFS scoping, so a repo can mix an S3 LFS remote with non-S3 remotes
-- Auto-install of the LFS transfer agent on first remote-helper run
+- Auto-install of the LFS transfer agent on first remote-helper run, scoped per remote (never the repo-wide `lfs.standalonetransferagent`)
 - Pushes no longer stall ~10s per push on git-lfs's pure-SSH endpoint probe of the `s3://` URL — the auto-install writes `remote.<name>.lfsurl`, which suppresses it
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
@@ -406,7 +406,7 @@ git push --set-upstream origin main
 git clone s3://my-git-bucket/lfs-repo lfs-repo-clone
 ```
 
-`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone` and `git submodule add` work without extra setup. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; existing `lfs.standalonetransferagent` or `remote.<name>.lfsurl` settings are never overwritten.
+`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone` and `git submodule add` work without extra setup. It writes exactly the same per-remote keys as `git-lfs-s3 install --remote <name>` — `lfs.customtransfer.git-lfs-s3.path`, `remote.<name>.lfsurl` and the URL-scoped `lfs.<url>.standalonetransferagent` — and never the repo-wide `lfs.standalonetransferagent`. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; an existing `lfs.standalonetransferagent` naming another agent, or an existing `remote.<name>.lfsurl`, suppresses the install entirely, and nothing is written for a remote that is not an `s3://` URL.
 
 ## Notes about specific behaviors of Amazon S3 remotes
 
