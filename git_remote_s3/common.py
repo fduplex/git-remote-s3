@@ -8,6 +8,7 @@ import functools
 import re
 import subprocess
 import sys
+import urllib.parse
 
 import dns.exception
 import dns.resolver
@@ -269,8 +270,14 @@ def synthetic_lfs_url(bucket: str, prefix: str) -> str:
     alias-resolved bucket name: a DNS alias is the remote's stable public
     identity, and persisting it keeps the rendered git config valid when the
     alias is re-pointed at a different bucket.
+
+    Prefix segments are percent-encoded: an unencoded ``%`` (e.g. ``repo%zz``)
+    makes git-lfs resolve the endpoint as ``<unknown>``. Bucket names cannot
+    contain URL-reserved characters (nor can a DNS alias hostname), so the
+    bucket is left as-is.
     """
-    return f"https://{LFS_ALIAS_HOST}/{bucket}/{prefix}"
+    quoted_prefix = "/".join(urllib.parse.quote(segment, safe="") for segment in prefix.split("/"))
+    return f"https://{LFS_ALIAS_HOST}/{bucket}/{quoted_prefix}"
 
 
 _ACCESS_GRANTS_FALLBACK_NOTICE = (
