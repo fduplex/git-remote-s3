@@ -10,6 +10,13 @@ import pytest
 from git_remote_s3 import common
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_git_shallow_check: exempt from remote_test.py's autouse is_shallow_repository stub",
+    )
+
+
 @pytest.fixture
 def temp_git_repo(monkeypatch):
     """A throwaway git repo as cwd, with every env var the helper reads cleared.

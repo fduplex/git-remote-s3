@@ -29,6 +29,21 @@ MOCK_ARCHIVE_CONTENT = b"MOCK_ARCHIVE_CONTENT"
 BRANCH = "pytest"
 
 
+@pytest.fixture(autouse=True)
+def _not_shallow(request, monkeypatch):
+    # This suite's cwd is the project's own checkout, whose shallowness depends on how it was
+    # cloned (e.g. CI's fetch-depth:1). cmd_push's pre-flight shallow guard would otherwise make
+    # every push test here environment-dependent. Tests that exercise the shallow-clone path
+    # patch git.is_shallow_repository themselves and take precedence over this default.
+    # test_is_shallow_repository_distinguishes_shallow_from_partial exercises the real function
+    # against temp repos it controls and must see the genuine result, not this stub.
+    if "real_git_shallow_check" in request.keywords:
+        yield
+        return
+    monkeypatch.setattr(git, "is_shallow_repository", lambda: False)
+    yield
+
+
 def create_list_objects_v2_mock(
     *,
     protected=False,
@@ -1506,6 +1521,7 @@ def _clone(origin, dest, *extra):
     return dest
 
 
+@pytest.mark.real_git_shallow_check
 def test_is_shallow_repository_distinguishes_shallow_from_partial(tmp_path, monkeypatch):
     origin = _make_origin(tmp_path)
 
