@@ -7,10 +7,15 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 
 - Fix for LFS temp-file paths when the repo is used as a submodule
 - Per-remote LFS scoping, so a repo can mix an S3 LFS remote with non-S3 remotes
-- Auto-install of the LFS transfer agent on first remote-helper run
+- Auto-install of the LFS transfer agent on first remote-helper run, scoped per remote (never the repo-wide `lfs.standalonetransferagent`)
+- Pushes no longer stall ~10s per push on git-lfs's pure-SSH endpoint probe of the `s3://` URL — the auto-install writes `remote.<name>.lfsurl`, which suppresses it
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
 - Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
+- Pushing from a shallow clone is rejected with a clear error telling you to run `git fetch --unshallow` first, instead of silently uploading a truncated bundle
+- Partial clones (`git clone --filter=blob:none` / `--filter=tree:0`) are fully supported for push and fetch
+- Push and fetch render live transfer progress on the terminal, honoring `git push --quiet` / `--progress`
+- `--force-with-lease` is supported with real compare-and-swap semantics against the remote ref, not just a `+` force push
 
 Not affiliated with or endorsed by Amazon Web Services.
 
@@ -35,6 +40,7 @@ It also provide an implementation of the [git-lfs custom transfer](https://githu
   - [Create a new repo](#create-a-new-repo)
   - [Clone a repo](#clone-a-repo)
   - [DNS bucket aliases](#dns-bucket-aliases)
+  - [Bucket region cache](#bucket-region-cache)
   - [S3 Access Grants](#s3-access-grants)
   - [Branches, etc.](#branches-etc)
   - [Using S3 remotes for submodules](#using-s3-remotes-for-submodules)
@@ -85,7 +91,7 @@ Before you can use `git-remote-s3`, you must:
       {
         "Sid": "S3ObjectAccess",
         "Effect": "Allow",
-        "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+        "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
         "Resource": ["arn:aws:s3:::<BUCKET>/*"]
       },
       {
@@ -136,7 +142,8 @@ If you store multiple repos in a single bucket but would like to separate permis
         "Action": [
           "s3:PutObject",
           "s3:GetObject",
-          "s3:DeleteObject"
+          "s3:DeleteObject",
+          "s3:AbortMultipartUpload"
         ],
         "Resource": ["arn:aws:s3:::<BUCKET>/<REPO>/*"]
       },
@@ -231,6 +238,25 @@ git config s3.dns-alias false
 ```
 
 Both keys are booleans; setting the per-remote key to `true` re-enables aliasing for that remote even when `s3.dns-alias` is `false`. The per-remote key applies where a remote name is available (the git remote helper, the LFS transfer agent, `git-lfs-s3 install --remote`); the `git-s3` CLI takes a URI rather than a remote name and honors only `s3.dns-alias`.
+
+### Bucket region cache
+
+> **Fork addition** (not in upstream awslabs/git-remote-s3): the bucket's region is detected once and remembered in the repo's local git config.
+
+Every S3 client the remote helper builds is pinned to the bucket's own region, which otherwise costs a `HeadBucket` round trip on every single git command. The first successful detection is written to the repo-local git config as `remote.<name>.s3region`, and every later invocation reads it from there instead:
+
+```bash
+git config --get remote.origin.s3region
+# eu-west-1
+```
+
+The value is written on the first clone, fetch or push against a remote, and only for a real remote name — a push straight to a URI (`git push s3://bucket/repo ...`) detects the region and does not cache it. For submodules the key lands in the submodule's own config under `.git/modules/<name>/config`.
+
+If a bucket ever moves to another region, the cached value goes stale. The helper notices the redirect S3 returns, drops the key and retries once, so the operation still succeeds; you can also clear it by hand:
+
+```bash
+git config --unset remote.origin.s3region
+```
 
 ### S3 Access Grants
 
@@ -380,7 +406,7 @@ git push --set-upstream origin main
 git clone s3://my-git-bucket/lfs-repo lfs-repo-clone
 ```
 
-`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone` and `git submodule add` work without extra setup. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; existing `lfs.standalonetransferagent` or `remote.<name>.lfsurl` settings are never overwritten.
+`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone` and `git submodule add` work without extra setup. It writes exactly the same per-remote keys as `git-lfs-s3 install --remote <name>` — `lfs.customtransfer.git-lfs-s3.path`, `remote.<name>.lfsurl` and the URL-scoped `lfs.<url>.standalonetransferagent` — and never the repo-wide `lfs.standalonetransferagent`. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; an existing `lfs.standalonetransferagent` naming another agent, or an existing `remote.<name>.lfsurl`, suppresses the install entirely, and nothing is written for a remote that is not an `s3://` URL.
 
 ## Notes about specific behaviors of Amazon S3 remotes
 
@@ -429,7 +455,7 @@ run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale loc
 
 #### Lock timeout and cleanup
 
-- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable)
+- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable)
 - **Stale lock detection**: If a lock becomes stale (older than the TTL), it can be automatically replaced during lock acquisition
 - **Manual cleanup**: Use `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally clean up stale locks
 
@@ -456,7 +482,7 @@ Another client may be pushing. If this persists beyond 60s,
 run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
 ```
 
-The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable
+The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable
 If for some reason a reference's lock becomes stale, `git-remote-s3` automatically clears it when executing a git push.
 If you repeatedly run into lock acquisition failures or otherwise want to manually clean up stale locks, run `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally remove those stale locks.
 

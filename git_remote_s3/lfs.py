@@ -19,10 +19,14 @@ from .common import (
     s3_region_kwargs,
     synthetic_lfs_url,
     BucketAliasError,
+    TRANSFER_CONFIG,
 )
 from .git import validate_ref_name
 
 logger = logging.getLogger(__name__)
+
+# How the object stores we support spell "that key is not there" on HeadObject.
+_NOT_FOUND_CODES = ("404", "NoSuchKey", "NotFound")
 
 
 def _resolve_git_dir() -> str:
@@ -114,19 +118,35 @@ class LFSProcess:
         register_s3_access_grants(s3.meta.client, session)
         self.s3_bucket = s3.Bucket(self.bucket)
 
+    def _lfs_object_exists(self, key: str) -> bool:
+        client = self.s3_bucket.meta.client
+        try:
+            client.head_object(Bucket=self.s3_bucket.name, Key=key)
+            return True
+        except client.exceptions.ClientError as e:
+            # On AWS, HeadObject has no XML error body to parse a semantic code from, so botocore
+            # falls back to the raw HTTP status "404". S3-compatible backends (MinIO, Ceph RGW) do
+            # send a body and report "NoSuchKey" or "NotFound"; treating those as a hard failure
+            # would turn every first upload of an object into a transfer error.
+            if e.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
+                return False
+            raise
+
     def upload(self, event: dict):
         logger.debug("upload")
         try:
             self.init_s3_bucket()
-            if list(self.s3_bucket.objects.filter(Prefix=f"{self.prefix}/lfs/{event['oid']}")):
+            key = f"{self.prefix}/lfs/{event['oid']}"
+            if self._lfs_object_exists(key):
                 logger.debug("object already exists")
                 sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")
                 sys.stdout.flush()
                 return
             self.s3_bucket.upload_file(
                 event["path"],
-                f"{self.prefix}/lfs/{event['oid']}",
+                key,
                 Callback=ProgressPercentage(event["oid"]),
+                Config=TRANSFER_CONFIG,
             )
             sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")
         except Exception as e:
@@ -144,6 +164,7 @@ class LFSProcess:
                 Key=f"{self.prefix}/lfs/{event['oid']}",
                 Filename=f"{temp_dir}/{event['oid']}",
                 Callback=ProgressPercentage(event["oid"]),
+                Config=TRANSFER_CONFIG,
             )
             done_event = {
                 "event": "complete",

@@ -26,52 +26,71 @@ def archive(*, folder: str, ref: str) -> str:
     result = subprocess.run(
         ["git", "archive", "--format", "zip", "--output", file_path, ref],
         capture_output=True,
-        check=True,
     )
 
-    if result.returncode == 0:
-        return file_path
-    else:
-        raise GitError(result.stderr.decode("utf8"))
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to archive {ref}")
+    return file_path
 
 
-def bundle(*, folder: str, sha: str, ref: str) -> str:
+def bundle(*, folder: str, sha: str, ref: str, progress: bool = False, quiet: bool = False) -> str:
     """Bundles the content of the folder into a sha.bundle file
 
     Args:
         folder (str): the folder to bundle
         sha (str): the sha of the bundle. A bundle is stored as sha.bundle
         ref (str): the ref to bundle
+        progress (bool): let git render its own progress meter on the inherited stderr
+        quiet (bool): suppress git's output entirely
 
     Returns:
         str: the path to the bundle file
     """
     file_path = f"{folder}/{sha}.bundle"
+    args = ["git", "bundle", "create"]
+    if quiet:
+        args.append("-q")
+    elif progress:
+        args.append("--progress")
+    args += [file_path, ref]
+
+    # git's progress meter only reaches the user when stderr is inherited, so it cannot be
+    # captured in that mode; the captured text below is therefore only available when progress
+    # is off.
     result = subprocess.run(
-        ["git", "bundle", "create", file_path, ref],
-        capture_output=True,
-        check=True,
+        args,
+        stdout=subprocess.PIPE,
+        stderr=None if (progress and not quiet) else subprocess.PIPE,
     )
 
-    if result.returncode == 0:
-        return file_path
-    else:
-        raise GitError(result.stderr.decode("utf8"))
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to bundle {ref}")
+    return file_path
 
 
-def unbundle(*, folder: str, sha: str, ref: str):
+def unbundle(*, folder: str, sha: str, ref: str, progress: bool = False):
     """Unbundles the content of the bundle referred by the sha
 
     Args:
         folder (str): the folder where the bundle is located
         sha (str): the sha of the bundle. A bundle is stored as sha.bundle
         ref (str): the ref to checkout after unbundling
+        progress (bool): let git render its own progress meter on stderr
+
+    Raises:
+        GitError: if git could not apply the bundle
     """
-    subprocess.run(
-        ["git", "bundle", "unbundle", f"{folder}/{sha}.bundle", ref],
+    args = ["git", "bundle", "unbundle"]
+    if progress:
+        args.append("--progress")
+    args += [f"{folder}/{sha}.bundle", ref]
+    result = subprocess.run(
+        args,
         stdout=sys.stderr,
-        check=True,
     )
+
+    if result.returncode != 0:
+        raise GitError(f"failed to unbundle {sha} into {ref}")
 
 
 def rev_parse(ref: str) -> str:
@@ -110,6 +129,20 @@ def is_ancestor(ancestor: str, descendant: str) -> bool:
         stdout=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+def is_shallow_repository() -> bool:
+    """Checks whether the local repository has a truncated history
+
+    Returns:
+        bool: true if the repository is shallow
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0 and result.stdout.decode("utf8").strip() == "true"
 
 
 def get_remote_url(remote: str) -> str:
