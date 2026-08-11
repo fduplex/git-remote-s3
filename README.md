@@ -48,6 +48,7 @@ It also provide an implementation of the [git-lfs custom transfer](https://githu
   - [Archive file location](#archive-file-location)
   - [Example AWS CodePipeline source action config](#example-aws-codepipeline-source-action-config)
 - [LFS](#lfs)
+  - [Fetching through a facade URL (uv and friends)](#fetching-through-a-facade-url-uv-and-friends)
   - [Creating the repo and pushing](#creating-the-repo-and-pushing)
   - [Clone the repo](#clone-the-repo)
 - [Notes about specific behaviors of Amazon S3 remotes](#notes-about-specific-behaviors-of-amazon-s3-remotes)
@@ -388,6 +389,20 @@ git config lfs.basictransfersonly true
 ```
 
 which makes git-lfs omit the `transfers` array entirely. This setting is repo-wide and limits other remotes to basic HTTPS transfers; GitHub-style hosts already use these (even over SSH remotes), so only the rare server that speaks exclusively the pure-SSH LFS protocol is affected.
+
+### Fetching through a facade URL (uv and friends)
+
+Some tools invoke git-lfs with a URL instead of a remote name, in a directory that has no remotes configured at all: `uv` does exactly this for a git dependency with `lfs = true`, running `git lfs fetch <url> <sha>` inside its own cache directory. git-lfs passes that URL to the transfer agent verbatim, before any rewriting.
+
+For those callers, map the facade URL to the S3 remote with git's standard URL rewriting:
+
+```bash
+git config --global url."s3://<bucket>/<prefix>".insteadOf https://git.example.com/<prefix>
+git config --global lfs.customtransfer.git-lfs-s3.path git-lfs-s3
+git config --global lfs."https://s3".standalonetransferagent git-lfs-s3
+```
+
+The agent re-applies the `insteadOf` mapping itself (longest matching prefix wins, same as git) to recover the `s3://` URI, so the fetch works with no remote configured. Without a matching `insteadOf` entry it fails the transfer with an error naming the URL it could not map.
 
 ### Creating the repo and pushing
 
