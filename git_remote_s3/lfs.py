@@ -210,6 +210,66 @@ def _git_config_unset_all(key: str) -> None:
     )
 
 
+def _git_url_insteadof_rules() -> list[tuple[str, str]]:
+    """Returns the configured (matched-url-prefix, replacement-base) rewrite rules.
+
+    Reads every ``url.<base>.insteadOf`` value; a single base may carry several.
+    Config key names are matched case-insensitively (git lowercases the section
+    and variable, but not the ``<base>`` subsection), values verbatim.
+    """
+    res = subprocess.run(
+        ["git", "config", "--get-regexp", r"^url\..*\.insteadof$"],
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        return []
+    rules = []
+    for line in res.stdout.decode("utf-8").splitlines():
+        key, _, value = line.partition(" ")
+        if not value:
+            continue
+        base = key[len("url.") : -len(".insteadof")]
+        rules.append((value, base))
+    return rules
+
+
+def _apply_url_insteadof(url: str) -> str:
+    """Applies git's ``url.<base>.insteadOf`` rewriting to url.
+
+    Same semantics git uses: a rule matches on plain string prefix, and when
+    several match, the longest matched prefix wins.
+    """
+    matched_prefix = ""
+    base = None
+    for prefix, candidate in _git_url_insteadof_rules():
+        if url.startswith(prefix) and len(prefix) > len(matched_prefix):
+            matched_prefix, base = prefix, candidate
+    if base is None:
+        return url
+    return base + url[len(matched_prefix) :]
+
+
+def _resolve_s3_uri_from_url(url: str) -> str | None:
+    """Resolves a URL git-lfs passed as the init "remote" to an s3 URI.
+
+    git-lfs sends whatever it was given on the command line, which for callers
+    that never configure a remote (uv's ``git lfs fetch <url> <sha>`` in its
+    bare cache dir) is the pre-rewrite facade URL. Recovering the s3 URI means
+    re-applying the insteadOf rewriting git itself would have applied.
+
+    Returns None if the URL is not, and does not rewrite to, an s3 URI.
+    """
+    _, _, bucket, prefix = parse_git_url(url)
+    if bucket is not None and prefix is not None:
+        return url
+    rewritten = _apply_url_insteadof(url)
+    _, _, bucket, prefix = parse_git_url(rewritten)
+    if bucket is None or prefix is None:
+        return None
+    logger.debug(f"rewrote {url} to {rewritten}")
+    return rewritten
+
+
 def _list_git_remotes() -> list:
     """Returns the list of configured git remote names (empty on error)."""
     res = subprocess.run(
@@ -381,29 +441,43 @@ def main():  # noqa: C901
         logger.debug(line)
         event = json.loads(line)
         if event["event"] == "init":
-            # This is just another precaution but not strictly necessary since git would
-            # already have validated the origin name
-            if not validate_ref_name(event["remote"]):
-                logger.error(f"invalid ref {event['remote']}")
-                sys.stdout.write("{}\n")
-                sys.stdout.flush()
-                sys.exit(1)
-            result = subprocess.run(
-                ["git", "remote", "get-url", event["remote"]],
-                capture_output=True,
-            )
-            if result.returncode != 0:
-                logger.error(result.stderr.decode("utf-8").strip())
-                error_event = {
-                    "error": {
-                        "code": 2,
-                        "message": f'cannot resolve remote "{event["remote"]}"',
+            if "://" in event["remote"]:
+                s3uri = _resolve_s3_uri_from_url(event["remote"])
+                if s3uri is None:
+                    message = (
+                        f'cannot resolve remote URL "{event["remote"]}" to an s3:// URI. '
+                        f"Add a global git config entry mapping it to the S3 remote, e.g.: "
+                        f"git config --global url.s3://<bucket>/<prefix>.insteadOf {event['remote']}"
+                    )
+                    logger.error(message)
+                    error_event = {"error": {"code": 2, "message": message}}
+                    sys.stdout.write(f"{json.dumps(error_event)}\n")
+                    sys.stdout.flush()
+                    sys.exit(1)
+            else:
+                # This is just another precaution but not strictly necessary since git would
+                # already have validated the origin name
+                if not validate_ref_name(event["remote"]):
+                    logger.error(f"invalid ref {event['remote']}")
+                    sys.stdout.write("{}\n")
+                    sys.stdout.flush()
+                    sys.exit(1)
+                result = subprocess.run(
+                    ["git", "remote", "get-url", event["remote"]],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    logger.error(result.stderr.decode("utf-8").strip())
+                    error_event = {
+                        "error": {
+                            "code": 2,
+                            "message": f'cannot resolve remote "{event["remote"]}"',
+                        }
                     }
-                }
-                sys.stdout.write(f"{json.dumps(error_event)}")
-                sys.stdout.flush()
-                sys.exit(1)
-            s3uri = result.stdout.decode("utf-8").strip()
+                    sys.stdout.write(f"{json.dumps(error_event)}")
+                    sys.stdout.flush()
+                    sys.exit(1)
+                s3uri = result.stdout.decode("utf-8").strip()
             lfs_process = LFSProcess(s3uri=s3uri, remote_name=event["remote"])
 
         elif event["event"] == "upload":
