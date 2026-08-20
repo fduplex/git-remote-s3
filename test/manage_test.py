@@ -146,6 +146,7 @@ def _doctor(manifest, sizes=None, *, prefix=NESTED_PREFIX, delete_legacy=False):
     with (
         patch("boto3.Session"),
         patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite", return_value=client),
         patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
     ):
         store = ManifestStore(client, manifest=manifest, key=f"{prefix}/gitwal.json")
@@ -342,6 +343,7 @@ def _compact(manifest, tmp_path, put_results=()):
     with (
         patch("boto3.Session") as session_cls,
         patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite", return_value=client),
         patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
     ):
         session_cls.return_value.client.return_value.get_caller_identity.return_value = {"Arn": CALLER_ARN}
@@ -498,6 +500,7 @@ def _manage_branch(manifest, branch="main"):
     with (
         patch("boto3.Session"),
         patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite", return_value=client),
         patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
     ):
         store = ManifestStore(client, manifest=manifest, key="repo/gitwal.json")

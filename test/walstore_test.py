@@ -254,3 +254,31 @@ def test_an_unrelated_error_is_not_retried():
 
 def test_a_bucket_root_repo_keys_the_manifest_at_the_root():
     assert WalStore(FakeS3(), bucket=BUCKET, prefix="").key == gitwal.MANIFEST_KEY
+
+
+def test_conditional_puts_go_through_the_writer_client_and_reads_do_not():
+    reader = FakeS3(manifest_with(**{"refs/heads/main": SHA_MAIN}))
+    writer = FakeS3(manifest_with(**{"refs/heads/main": SHA_MAIN}))
+
+    store(reader, writer=lambda: writer).update(push("refs/heads/main", SHA_MINE))
+
+    assert reader.gets == 1 and reader.puts == []
+    assert writer.gets == 0 and len(writer.puts) == 1
+    assert writer.puts[0]["IfMatch"] == '"etag-0"'
+
+
+def test_the_writer_client_is_built_once_and_only_when_a_write_happens():
+    built = []
+
+    def writer():
+        built.append(FakeS3(manifest_with(**{"refs/heads/main": SHA_MAIN})))
+        return built[-1]
+
+    wal = store(FakeS3(manifest_with(**{"refs/heads/main": SHA_MAIN})), writer=writer)
+    wal.load()
+    assert built == []
+
+    wal.update(push("refs/heads/main", SHA_MINE))
+    wal.update(push("refs/heads/dev", SHA_MINE))
+
+    assert len(built) == 1

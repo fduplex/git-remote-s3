@@ -29,6 +29,7 @@ from .common import (
     BucketAliasError,
     TRANSFER_CONFIG,
     register_s3_access_grants,
+    register_s3_access_grants_readwrite,
     register_s3_access_grants_strict,
     resolve_bucket_alias,
     s3_region_kwargs,
@@ -105,11 +106,12 @@ class _Repo:
         self.bucket = bucket
         self.prefix = prefix
         self.session = boto3.Session(profile_name=profile)
-        self.s3 = register_s3_access_grants(
-            self.session.client("s3", **s3_region_kwargs(self.session, bucket)),
-            self.session,
-        )
-        self.wal = WalStore(self.s3, bucket=bucket, prefix=prefix)
+        region_kwargs = s3_region_kwargs(self.session, bucket)
+        self.s3 = register_s3_access_grants(self.session.client("s3", **region_kwargs), self.session)
+        # The manifest's conditional PUTs need a READWRITE-vended session, which S3 evaluates
+        # s3:GetObject against; the shared client's per-operation WRITE session would be denied.
+        self.write_s3 = register_s3_access_grants_readwrite(self.session.client("s3", **region_kwargs), self.session)
+        self.wal = WalStore(self.s3, bucket=bucket, prefix=prefix, writer=lambda: self.write_s3)
         self.name = prefix if prefix else "<bucket root>"
 
     def key(self, relative: str) -> str:

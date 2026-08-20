@@ -84,6 +84,7 @@ def _migrate(tmp_path, sizes, *, head=None, manifest=None, put_results=(), final
     with (
         patch("boto3.Session") as session_cls,
         patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite", return_value=client),
         patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
     ):
         session_cls.return_value.client.return_value.get_caller_identity.return_value = {"Arn": CALLER_ARN}

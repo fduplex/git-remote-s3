@@ -71,14 +71,38 @@ class WalStore:
 
     Composes keys the way the rest of the client does, from the bucket and repo prefix the remote
     was constructed with, and holds the caller's boto3 client rather than building its own.
+
+    ``writer`` is an optional zero-argument factory for a second client used only by the
+    conditional PUTs. Under S3 Access Grants those PUTs need a READWRITE-vended session (see
+    ``common.register_s3_access_grants_readwrite``), while reads stay on the caller's client. It
+    is called at most once, and only when a write actually happens, so a fetch never pays for it.
     """
 
-    def __init__(self, s3: Any, *, bucket: str, prefix: str, attempts: int = DEFAULT_ATTEMPTS):
+    def __init__(
+        self,
+        s3: Any,
+        *,
+        bucket: str,
+        prefix: str,
+        attempts: int = DEFAULT_ATTEMPTS,
+        writer: Callable[[], Any] | None = None,
+    ):
         self.s3 = s3
         self.bucket = bucket
         self.prefix = prefix
         self.attempts = attempts
         self.key = f"{prefix}/{gitwal.MANIFEST_KEY}" if prefix else gitwal.MANIFEST_KEY
+        self._writer = writer
+        self._write_s3: Any = None
+
+    @property
+    def write_s3(self) -> Any:
+        """The client the conditional PUTs go through: the read client unless a writer was given."""
+        if self._writer is None:
+            return self.s3
+        if self._write_s3 is None:
+            self._write_s3 = self._writer()
+        return self._write_s3
 
     def load(self) -> tuple[Manifest | None, str | None]:
         """Returns the manifest and its ETag, or (None, None) when the repo does not exist yet."""
@@ -137,15 +161,16 @@ class WalStore:
         return candidate if outcome == _COMMITTED else None
 
     def _put(self, manifest: Manifest, **condition: str) -> str:
+        s3 = self.write_s3
         try:
-            self.s3.put_object(
+            s3.put_object(
                 Bucket=self.bucket,
                 Key=self.key,
                 Body=gitwal.dump(manifest).encode("utf-8"),
                 ContentType="application/json",
                 **condition,
             )
-        except self.s3.exceptions.ClientError as x:
+        except s3.exceptions.ClientError as x:
             code = _code(x)
             if code in _STALE_CODES:
                 return _STALE

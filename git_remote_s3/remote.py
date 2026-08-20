@@ -34,6 +34,7 @@ from .common import (
     parse_git_url,
     resolve_bucket_alias,
     register_s3_access_grants,
+    register_s3_access_grants_readwrite,
     resolve_bucket_region,
     synthetic_lfs_url,
     BucketAliasError,
@@ -303,6 +304,7 @@ class S3Remote:
         self._s3: Any = None
         self._setup_lock = Lock()
         self._region_from_config = False
+        self._region: str | None = None
         # git passes the URL as argv[1] when pushing to a raw URL instead of to a configured
         # remote; only a real remote name has a config section to cache the bucket region under.
         named_remote = remote_name is not None and remote_name != remote_url and "://" not in remote_name
@@ -331,8 +333,20 @@ class S3Remote:
         """The manifest's CAS store, built once the alias-resolved bucket name is known."""
         self._ensure_s3()
         if self._wal is None:
-            self._wal = WalStore(self._s3, bucket=self.bucket, prefix=self.prefix)
+            self._wal = WalStore(
+                self._s3,
+                bucket=self.bucket,
+                prefix=self.prefix,
+                writer=self._build_manifest_writer_client,
+            )
         return self._wal
+
+    def _build_manifest_writer_client(self) -> Any:
+        """Builds the READWRITE-vending client the manifest's conditional PUTs go through."""
+        return register_s3_access_grants_readwrite(
+            self.session.client("s3", **({"region_name": self._region} if self._region else {})),
+            self.session,
+        )
 
     def _ensure_s3(self) -> None:
         """Pays the one-off AWS setup cost: alias resolution, session, region and client.
@@ -381,6 +395,7 @@ class S3Remote:
             region = resolve_bucket_region(self.session, self.bucket)
             if region and self._region_config_key:
                 _git_config_run("--local", self._region_config_key, region)
+        self._region = region
         return register_s3_access_grants(
             self.session.client("s3", **({"region_name": region} if region else {})),
             self.session,
