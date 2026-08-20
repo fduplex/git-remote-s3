@@ -59,6 +59,28 @@ def pack_objects(
         Pack: the written pack, with objects == 0 when the remote already holds everything.
     """
     revs = [sha, *(f"^{h}" for h in have if has_object(h))]
+    return _pack(folder=folder, revs=revs, subject=sha, progress=progress, quiet=quiet)
+
+
+def pack_all(*, folder: str, shas: Iterable[str], progress: bool = False, quiet: bool = False) -> Pack:
+    """Packs everything reachable from every sha, with no exclusions: compaction's base pack.
+
+    The union of the refs is packed once rather than once per ref, so history shared between
+    branches is stored a single time.
+
+    Args:
+        folder: directory to write the pack into
+        shas: every tip the manifest names
+        progress: let git render its own progress meter on the inherited stderr
+        quiet: suppress git's output entirely
+    """
+    revs = sorted(set(shas))
+    if not revs:
+        raise GitError("cannot pack an empty ref set")
+    return _pack(folder=folder, revs=revs, subject=" ".join(revs), progress=progress, quiet=quiet)
+
+
+def _pack(*, folder: str, revs: list[str], subject: str, progress: bool, quiet: bool) -> Pack:
     args = ["git", "pack-objects", "--revs"]
     if quiet:
         args.append("-q")
@@ -75,11 +97,11 @@ def pack_objects(
         stderr=None if (progress and not quiet) else subprocess.PIPE,
     )
     if result.returncode != 0:
-        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to pack {sha}")
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to pack {subject}")
 
     lines = [line for line in result.stdout.decode("utf8").split("\n") if line.strip()]
     if not lines:
-        raise GitError(f"git pack-objects wrote no pack for {sha}")
+        raise GitError(f"git pack-objects wrote no pack for {subject}")
     checksum = lines[-1].strip()
     path = f"{folder}/pack-{checksum}.pack"
     return Pack(path=path, checksum=checksum, bytes=_file_size(path), objects=_pack_object_count(path))
