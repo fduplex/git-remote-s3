@@ -49,6 +49,14 @@ class Reject(WalStoreError):
     """
 
 
+class AlreadyExistsError(WalStoreError):
+    """A must-create write found gitwal.json already there."""
+
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(f"{key} already exists; it was created by another client")
+
+
 class CasExhaustedError(WalStoreError):
     """The manifest was contended for the whole attempt budget and never committed."""
 
@@ -101,6 +109,16 @@ class WalStore:
                 return committed
             self._backoff(attempt)
         raise CasExhaustedError(self.key, self.attempts)
+
+    def create(self, manifest: Manifest) -> Manifest:
+        """Writes a manifest that must not already exist: one conditional PUT, no retry.
+
+        Migration is the only caller. ``update`` would treat a concurrent creation as contention
+        and retry as an update, which for migration would silently rewrite someone else's repo.
+        """
+        if self._put(manifest, IfNoneMatch="*") != _COMMITTED:
+            raise AlreadyExistsError(self.key)
+        return manifest
 
     def _create(self, mutate: Callable[[Manifest], Manifest]) -> Manifest | None:
         candidate = mutate(Manifest())

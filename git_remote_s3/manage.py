@@ -6,7 +6,10 @@
 # scoped list prefixes, prefix-relative key parsing.
 
 import argparse
+import contextlib
 import datetime
+import os
+import re
 import shutil
 import sys
 import tempfile
@@ -71,6 +74,30 @@ def _is_legacy_key(rel: str) -> bool:
     return rel == "HEAD" or leaf in ("PROTECTED#", "repo.zip") or rel.endswith((".lock", ".bundle"))
 
 
+# The pre-manifest ref layout: <repo>/refs/heads|tags/<name>/<sha>.bundle, where <name> may itself
+# contain slashes. Both hash algorithms are accepted; the old reader's sha1-only filter is a bug
+# migration must not inherit.
+_BUNDLE_RE = re.compile(r"^(refs/(?:heads|tags)/.+)/([0-9a-f]{40}|[0-9a-f]{64})\.bundle$")
+
+_PROTECTED_MARKER = "PROTECTED#"
+
+_ROLLBACK = "Rollback: delete gitwal.json and packs/ to roll back; legacy keys are untouched"
+
+
+@contextlib.contextmanager
+def _git_dir(path: str):
+    """Points the git module's subprocesses at another repository for the duration."""
+    previous = os.environ.get("GIT_DIR")
+    os.environ["GIT_DIR"] = path
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("GIT_DIR", None)
+        else:
+            os.environ["GIT_DIR"] = previous
+
+
 class _Repo:
     """The S3 half every command shares: a client, the repo prefix, and the manifest store."""
 
@@ -106,6 +133,40 @@ class _Repo:
             return self.session.client("sts").get_caller_identity()["Arn"]
         except Exception:
             return None
+
+    def list_packs(self) -> dict[str, int]:
+        """{repo-relative pack key -> size in bytes} for everything under <repo>/packs/."""
+        relative = f"{gitwal.PACKS_PREFIX}/"
+        base = scoped_list_prefix(self.prefix)
+        return {o["Key"].removeprefix(base): o["Size"] for o in self.list_objects(relative)}
+
+    def incomplete_refs(self, refs: dict[str, str]) -> list[tuple[str, str]]:
+        """The (ref, sha) pairs this clone cannot pack: absent object, or truncated history."""
+        return [
+            (ref, sha)
+            for ref, sha in sorted(refs.items())
+            if not git.has_object(sha) or not git.has_complete_history(sha)
+        ]
+
+    def upload_pack(self, pack: "git.Pack", tips: dict[str, str]) -> gitwal.Entry:
+        """Writes a base pack to its content-addressed key. Not a commit point."""
+        relative_key = f"{gitwal.PACKS_PREFIX}/{pack.checksum}.pack"
+        print(f"Uploading base pack {relative_key} ({_human_bytes(pack.bytes)}, {pack.objects} objects)")
+        self.s3.upload_file(
+            Filename=pack.path,
+            Bucket=self.bucket,
+            Key=self.key(relative_key),
+            Config=TRANSFER_CONFIG,
+        )
+        return gitwal.Entry(
+            kind=gitwal.KIND_BASE,
+            pack=relative_key,
+            bytes=pack.bytes,
+            objects=pack.objects,
+            tips=dict(tips),
+            by=self.caller_arn(),
+            at=_now(),
+        )
 
 
 class Doctor(_Repo):
@@ -224,12 +285,6 @@ class Doctor(_Repo):
             print(f" compaction: {len(manifest.entries)} entries would collapse to 1")
         return len(missing)
 
-    def list_packs(self) -> dict[str, int]:
-        """{repo-relative pack key -> size in bytes} for everything under <repo>/packs/."""
-        relative = f"{gitwal.PACKS_PREFIX}/"
-        base = scoped_list_prefix(self.prefix)
-        return {o["Key"].removeprefix(base): o["Size"] for o in self.list_objects(relative)}
-
     def list_repo_objects(self) -> list[dict]:
         return self.list_objects()
 
@@ -284,7 +339,7 @@ class Compact(_Repo):
         if git.is_shallow_repository():
             sys.stderr.write("fatal: cannot compact from a shallow clone; run git fetch --unshallow first\n")
             return 1
-        incomplete = self.incomplete_refs(manifest)
+        incomplete = self.incomplete_refs(manifest.refs)
         if incomplete:
             sys.stderr.write("fatal: this clone does not hold every ref the manifest names:\n")
             for ref, sha in incomplete:
@@ -299,7 +354,7 @@ class Compact(_Repo):
         temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_compact_")
         try:
             pack = git.pack_all(folder=temp_dir, shas=manifest.refs.values(), quiet=True)
-            entry = self.upload(pack, manifest)
+            entry = self.upload_pack(pack, manifest.refs)
         except (GitError, ClientError) as x:
             sys.stderr.write(f"fatal: {x}\n")
             return 1
@@ -339,33 +394,6 @@ class Compact(_Repo):
         print(f"Deleted {deleted} superseded pack{'' if deleted == 1 else 's'}")
         return 0
 
-    def incomplete_refs(self, manifest: gitwal.Manifest) -> list[tuple[str, str]]:
-        return [
-            (ref, sha)
-            for ref, sha in sorted(manifest.refs.items())
-            if not git.has_object(sha) or not git.has_complete_history(sha)
-        ]
-
-    def upload(self, pack: "git.Pack", manifest: gitwal.Manifest) -> gitwal.Entry:
-        """Writes the base pack to its content-addressed key. Not a commit point."""
-        relative_key = f"{gitwal.PACKS_PREFIX}/{pack.checksum}.pack"
-        print(f"Uploading base pack {relative_key} ({_human_bytes(pack.bytes)}, {pack.objects} objects)")
-        self.s3.upload_file(
-            Filename=pack.path,
-            Bucket=self.bucket,
-            Key=self.key(relative_key),
-            Config=TRANSFER_CONFIG,
-        )
-        return gitwal.Entry(
-            kind=gitwal.KIND_BASE,
-            pack=relative_key,
-            bytes=pack.bytes,
-            objects=pack.objects,
-            tips=dict(manifest.refs),
-            by=self.caller_arn(),
-            at=_now(),
-        )
-
     def delete_packs(self, packs: list[str]) -> int:
         deleted = 0
         for pack in packs:
@@ -384,6 +412,214 @@ def _fingerprint(manifest: gitwal.Manifest) -> tuple[Any, ...]:
         tuple((e.seq, e.pack) for e in manifest.entries),
         tuple(sorted(manifest.refs.items())),
     )
+
+
+class Migrate(_Repo):
+    """Moves one repo from the bundle format to the WAL manifest, under supervision.
+
+    Phase 1 writes packs/<sha>.pack and gitwal.json alongside the legacy keys and touches nothing
+    else. The two formats are mutually invisible -- the old helper lists only *.bundle under refs/,
+    the new client reads only the manifest -- so both are live and correct at once and rollback is
+    deleting what phase 1 wrote. Phase 2 (``--finalize``) deletes the legacy keys and is the point
+    of no return, which is why it is a separate command behind its own flag.
+    """
+
+    def __init__(self, profile, bucket, prefix, finalize=False, yes=False) -> None:
+        super().__init__(profile, bucket, prefix)
+        self.finalize = finalize
+        self.yes = yes
+
+    def run(self) -> int:
+        return self.run_finalize() if self.finalize else self.run_migrate()
+
+    def run_migrate(self) -> int:  # noqa: C901
+        refs = self.preflight()
+        if refs is None:
+            return 1
+
+        head = self.read_head()
+        protected = self.read_protected()
+        print(f"Migrating {self.name}: {len(refs)} refs, HEAD {head or 'unset'}, {len(protected)} protected")
+
+        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_migrate_")
+        try:
+            pack = git.pack_all(folder=temp_dir, shas=refs.values(), quiet=True)
+            entry = self.upload_pack(pack, refs)
+            manifest = gitwal.apply_push(gitwal.Manifest(), refs=refs, entry=entry, head=head)
+            # Set inline rather than through apply_protect: every marker is part of the same
+            # seq-1 creation, and each apply_ call would bump the seq again.
+            manifest.protected = protected
+            self.wal.create(manifest)
+            print(f"Created gitwal.json at seq {manifest.seq}")
+            problems = self.verify(refs, head, entry, folder=temp_dir)
+        except (GitError, WalStoreError, gitwal.ManifestError, ClientError) as x:
+            sys.stderr.write(f"fatal: {x}\n")
+            return 1
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if problems:
+            sys.stderr.write("fatal: the migrated repo does not verify:\n")
+            for problem in problems:
+                sys.stderr.write(f"  {problem}\n")
+            sys.stderr.write(_ROLLBACK + "\n")
+            return 1
+        self.report_migrated()
+        return 0
+
+    def preflight(self) -> dict[str, str] | None:
+        """Everything that must hold before a byte is written. None means refuse."""
+        manifest, _etag = self.wal.load()
+        if manifest is not None:
+            sys.stderr.write("fatal: gitwal.json already exists; this repo has already been migrated\n")
+            return None
+
+        bundles = self.bundle_refs()
+        duplicates = {ref: shas for ref, shas in bundles.items() if len(shas) > 1}
+        if duplicates:
+            sys.stderr.write("fatal: these refs carry more than one bundle:\n")
+            for ref, shas in sorted(duplicates.items()):
+                sys.stderr.write(f"  {ref}: {', '.join(sorted(shas))}\n")
+            sys.stderr.write("resolve duplicate bundles first: keep the tip you want and delete the others\n")
+            return None
+        if not bundles:
+            sys.stderr.write("fatal: no bundles under refs/; there is nothing to migrate\n")
+            return None
+
+        if git.is_shallow_repository():
+            sys.stderr.write("fatal: cannot migrate from a shallow clone; run git fetch --unshallow first\n")
+            return None
+        refs = {ref: shas[0] for ref, shas in bundles.items()}
+        incomplete = self.incomplete_refs(refs)
+        if incomplete:
+            sys.stderr.write("fatal: this clone does not hold every ref the bundles name:\n")
+            for ref, sha in incomplete:
+                sys.stderr.write(f"  {ref} {sha}\n")
+            sys.stderr.write("run git fetch --all and re-run migrate from a full clone\n")
+            return None
+        return refs
+
+    def bundle_refs(self) -> dict[str, list[str]]:
+        """{full refname -> the shas its bundle keys name}, from the legacy layout."""
+        base = scoped_list_prefix(self.prefix)
+        found: dict[str, list[str]] = {}
+        for obj in self.list_objects("refs/"):
+            match = _BUNDLE_RE.match(obj["Key"].removeprefix(base))
+            if match:
+                found.setdefault(match.group(1), []).append(match.group(2))
+        return found
+
+    def read_head(self) -> str | None:
+        """The refname in the <repo>/HEAD object, or None when the repo never had one."""
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=self.key("HEAD"))
+        except self.s3.exceptions.NoSuchKey:
+            return None
+        except self.s3.exceptions.ClientError as x:
+            if x.response.get("Error", {}).get("Code") in ("NoSuchKey", "NotFound", "404"):
+                return None
+            raise
+        return response["Body"].read().decode("utf-8").strip() or None
+
+    def read_protected(self) -> list[str]:
+        """The refs carrying a PROTECTED# marker, derived from the marker keys."""
+        base = scoped_list_prefix(self.prefix)
+        marker = f"/{_PROTECTED_MARKER}"
+        return sorted(
+            obj["Key"].removeprefix(base).removesuffix(marker)
+            for obj in self.list_objects("refs/")
+            if obj["Key"].endswith(marker)
+        )
+
+    def verify(self, refs: dict[str, str], head: str | None, entry: gitwal.Entry, *, folder: str) -> list[str]:
+        """Reads back what was written and rebuilds every ref from the stored pack alone.
+
+        Cloning through the new path would need a real endpoint and the helper on PATH, so this
+        checks the two properties a clone would have proved: the manifest S3 now serves names
+        every ref at the sha its bundle key named, and the pack S3 now holds reconstructs each of
+        those tips in a repository that starts empty. Ref names are not rev-parsed against the
+        local clone -- a clone holds the remote's branches under refs/remotes/* -- so the local
+        side is checked by sha, in preflight.
+        """
+        stored, _etag = self.wal.load()
+        if stored is None:
+            return ["gitwal.json cannot be read back from S3"]
+
+        problems = [f"schema {f.code}: {f.message}" for f in gitwal.errors(gitwal.validate(stored))]
+        if stored.seq != 1:
+            problems.append(f"seq is {stored.seq}, not 1")
+        if stored.refs != refs:
+            problems.append(f"manifest refs {stored.refs} do not match the bundle keys {refs}")
+        if stored.head != head:
+            problems.append(f"manifest head is {stored.head!r}, not {head!r}")
+        if [e.pack for e in stored.entries] != [entry.pack]:
+            problems.append(f"manifest entries name {[e.pack for e in stored.entries]}, not [{entry.pack!r}]")
+
+        restored = f"{folder}/verify.git"
+        pack_path = f"{folder}/verify.pack"
+        try:
+            git.init_bare(restored)
+            self.s3.download_file(Bucket=self.bucket, Key=self.key(entry.pack), Filename=pack_path)
+            with _git_dir(restored):
+                git.index_pack(path=pack_path)
+                for ref, sha in sorted(refs.items()):
+                    if not git.has_object(sha) or not git.has_complete_history(sha):
+                        problems.append(f"{ref} {sha} is not reconstructible from {entry.pack}")
+        except (GitError, ClientError, OSError) as x:
+            problems.append(f"could not rebuild the repo from {entry.pack}: {x}")
+        return problems
+
+    def report_migrated(self) -> None:
+        print(f"\nMigrated {self.name}. Observe before finalizing:")
+        print("  - the materializer fires on the gitwal.json PUT: confirm this repo re-rendered")
+        print("  - the SPA lists this repo's branches at their expected tips")
+        print("  - clone and push once through the new client")
+        print("  - the legacy keys are still present; nothing has been deleted")
+        print(f"\n{_ROLLBACK}")
+        print("When satisfied: git-s3 migrate --finalize --yes <remote>")
+
+    def run_finalize(self) -> int:
+        if not self.yes:
+            sys.stderr.write(
+                "fatal: --finalize deletes this repo's pre-migration keys and cannot be undone; "
+                "re-run with --yes once the repo has been observed\n"
+            )
+            return 1
+
+        manifest, _etag = self.wal.load()
+        if manifest is None:
+            sys.stderr.write("fatal: no gitwal.json in this repo; migrate it before finalizing\n")
+            return 1
+        findings = gitwal.errors(gitwal.validate(manifest))
+        if findings:
+            sys.stderr.write("fatal: gitwal.json does not validate; refusing to delete anything:\n")
+            for finding in findings:
+                sys.stderr.write(f"  {finding.code}: {finding.message}\n")
+            return 1
+        stored = self.list_packs()
+        missing = [e.pack for e in manifest.entries if e.pack not in stored]
+        if missing:
+            sys.stderr.write("fatal: the manifest names packs that are not in the bucket:\n")
+            for pack in missing:
+                sys.stderr.write(f"  {pack}\n")
+            return 1
+
+        base = scoped_list_prefix(self.prefix)
+        legacy = [o["Key"] for o in self.list_objects() if _is_legacy_key(o["Key"].removeprefix(base))]
+        if not legacy:
+            print(f"{self.name}: no pre-migration keys left; nothing to finalize")
+            return 0
+
+        failures = 0
+        for key in legacy:
+            try:
+                self.s3.delete_object(Bucket=self.bucket, Key=key)
+                print(f"deleted {key}")
+            except ClientError as x:
+                failures += 1
+                print(f"could not delete {key}: {x}")
+        print(f"Finalized {self.name}: {len(legacy) - failures} of {len(legacy)} pre-migration keys deleted")
+        return 1 if failures else 0
 
 
 class ManageBranch(_Repo):
@@ -433,6 +669,16 @@ def main():  # noqa: C901
         action="store_true",
         help="Delete the pre-migration keys doctor reports (bundles, PROTECTED#, locks, repo.zip, HEAD)",
     )
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help="migrate: delete the pre-migration keys, after the repo has been observed",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="migrate --finalize: confirm the deletion, which cannot be undone",
+    )
     # Optional: "doctor" and "compact" don't take a branch; delete-branch/protect/unprotect
     # validate it's present themselves (see the args.branch is None check below).
     parser.add_argument(
@@ -463,6 +709,8 @@ def main():  # noqa: C901
             sys.exit(Doctor(profile, bucket, prefix, args.delete_legacy).run())
         if args.command == "compact":
             sys.exit(Compact(profile, bucket, prefix).run())
+        if args.command == "migrate":
+            sys.exit(Migrate(profile, bucket, prefix, args.finalize, args.yes).run())
         if args.command == "delete-branch" or args.command == "protect" or args.command == "unprotect":
             if args.branch is None:
                 sys.stderr.write("fatal: --branch is required\n")

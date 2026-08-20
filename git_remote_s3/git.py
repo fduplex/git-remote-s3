@@ -147,6 +147,17 @@ def index_pack(*, path: str, progress: bool = False) -> None:
         raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to index {path}")
 
 
+def init_bare(path: str) -> None:
+    """Creates an empty bare repository, for checking a pack reconstructs its refs on its own."""
+    result = subprocess.run(
+        ["git", "init", "-q", "--bare", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to init {path}")
+
+
 def has_complete_history(sha: str) -> bool:
     """Whether the whole commit and tree graph reachable from sha is present locally.
 
