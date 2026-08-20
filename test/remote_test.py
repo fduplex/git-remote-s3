@@ -1,4 +1,3 @@
-import datetime
 import os
 import re
 import subprocess
@@ -6,24 +5,17 @@ from io import StringIO, BytesIO
 from unittest.mock import patch
 
 import boto3.exceptions
-import botocore
-import botocore.client
-import botocore.exceptions
 import pytest
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import S3Remote, UriScheme, git, gitwal, walstore
-from git_remote_s3.remote import NotAuthorizedError, TransferProgress
+from git_remote_s3 import remote as remote_module
+from git_remote_s3.remote import FetchIncompleteError, NotAuthorizedError, TransferProgress
 
 SHA1 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8a"
 SHA2 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8b"
 MOVED_SHA = "c105d19ba64965d2c9d3d3246e7269059ef8bb8c"
 NULL_SHA = "0" * 40
-INVALID_SHA = "z45"
-BUNDLE_SUFFIX = ".bundle"
-MOCK_BUNDLE_CONTENT = b"MOCK_BUNDLE_CONTENT"
-ARCHIVE_SUFFIX = ".zip"
-MOCK_ARCHIVE_CONTENT = b"MOCK_ARCHIVE_CONTENT"
 BRANCH = "pytest"
 
 
@@ -42,246 +34,92 @@ def _not_shallow(request, monkeypatch):
     yield
 
 
-def create_list_objects_v2_mock(
-    *,
-    protected=False,
-    no_head=False,
-    branch=BRANCH,
-    shas,
-):
-    def s3_list_objects_v2_mock(Prefix, **kwargs):
-        content = []
-        for s in shas:
-            content.append(
-                {
-                    "Key": f"test_prefix/refs/heads/{branch}/{s}.bundle",
-                    "LastModified": datetime.datetime.now(),
-                }
-            )
-        if protected:
-            content.append(
-                {
-                    "Key": f"test_prefix/refs/heads/{branch}/PROTECTED#",
-                    "LastModified": datetime.datetime.now(),
-                }
-            )
-        if not no_head:
-            content.append(
-                {
-                    "Key": "test_prefix/HEAD",
-                    "LastModified": datetime.datetime.now(),
-                }
-            )
-        return {
-            # ty: heterogeneous mock dict; the "Key" value is always a str here
-            "Contents": [c for c in content if c["Key"].startswith(Prefix)],  # ty: ignore[unresolved-attribute]
-            "NextContinuationToken": None,
-        }
-
-    return s3_list_objects_v2_mock
-
-
 @patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
-def test_cmd_list(session_client_mock, stdout_mock):
+def test_cmd_list_advertises_the_manifests_refs_and_head(session_client_mock, stdout_mock):
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA1])
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
-    s3_remote.cmd_list()
-    assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_list_refs(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "nested/test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.return_value = {
-        "Contents": [
-            {
-                "Key": f"nested/test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
-                "LastModified": datetime.datetime.now(),
-            },
-            {
-                "Key": f"nested/test_prefix/refs/tags/v1/{SHA1}.bundle",
-                "LastModified": datetime.datetime.now(),
-            },
-        ]
-    }
-
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "nested/test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
-    refs = s3_remote.list_refs(bucket=s3_remote.bucket, prefix=s3_remote.prefix)
-    assert len(refs) == 2
-    assert f"refs/heads/{BRANCH}/{SHA1}.bundle" in refs
-    assert f"refs/tags/v1/{SHA1}.bundle" in refs
-    refs_call = session_client_mock.return_value.list_objects_v2.call_args_list[-1]
-    assert refs_call.kwargs["Prefix"] == "nested/test_prefix/refs"
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_list_refs_scopes_listing_away_from_lfs_objects(session_client_mock, stdout_mock):
-    # list_refs must narrow its ListObjectsV2 call to the refs/ subtree server-side, so an
-    # LFS-heavy repo does not paginate through every "lfs/<oid>" object on every push/fetch.
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    def s3_list_objects_v2_mock(Prefix, **kwargs):
-        content = [
-            {
-                "Key": f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
-                "LastModified": datetime.datetime.now(),
-            },
-            {
-                "Key": "test_prefix/lfs/deadbeef",
-                "LastModified": datetime.datetime.now(),
-            },
-        ]
-        return {
-            # ty: heterogeneous mock dict; the "Key" value is always a str here
-            "Contents": [c for c in content if c["Key"].startswith(Prefix)],  # ty: ignore[unresolved-attribute]
-            "NextContinuationToken": None,
-        }
-
-    session_client_mock.return_value.list_objects_v2.side_effect = s3_list_objects_v2_mock
-
-    refs = s3_remote.list_refs(bucket=s3_remote.bucket, prefix=s3_remote.prefix)
-
-    assert refs == [f"refs/heads/{BRANCH}/{SHA1}.bundle"]
-    refs_call = session_client_mock.return_value.list_objects_v2.call_args_list[-1]
-    assert refs_call.kwargs["Prefix"] == "test_prefix/refs"
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_list_refs_empty_prefix_scopes_to_leading_slash_refs(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "")
-
-    session_client_mock.return_value.list_objects_v2.return_value = {
-        "Contents": [
-            {
-                "Key": f"/refs/heads/{BRANCH}/{SHA1}.bundle",
-                "LastModified": datetime.datetime.now(),
-            }
-        ]
-    }
-
-    refs = s3_remote.list_refs(bucket=s3_remote.bucket, prefix=s3_remote.prefix)
-
-    calls = session_client_mock.return_value.list_objects_v2.call_args_list
-    # list_refs scopes server-side to the refs/ subtree ("<prefix>/refs"); for a
-    # bucket-root repo (prefix=="") that is "/refs". Bundle keys for such a repo are written as
-    # f"{prefix}/{ref}/..." = "/refs/...", carrying that same leading slash, so "/refs" still
-    # matches them correctly -- this is unchanged behavior, not a quirk introduced by scoping.
-    assert [c.kwargs["Prefix"] for c in calls] == ["/refs"]
-    assert refs == [f"refs/heads/{BRANCH}/{SHA1}.bundle"]
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_cmd_list_nested_prefix(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "nested/test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.return_value = {
-        "Contents": [
-            {
-                "Key": f"nested/test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
-                "LastModified": datetime.datetime.now(),
-            },
-            {
-                "Key": "nested/test_prefix/HEAD",
-                "LastModified": datetime.datetime.now(),
-            },
-        ]
-    }
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "nested/test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
-    s3_remote.cmd_list()
-    assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_cmd_list_no_head(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(
-        shas=[SHA1], no_head=True
+    install_wal(
+        session_client_mock.return_value,
+        wal_manifest({REF: SHA1, "refs/tags/v1": SHA2}, head=REF),
     )
 
-    def error(**kwargs):
-        raise botocore.exceptions.ClientError({"Error": {"Code": "NoSuchKey"}}, "get_object")
-
-    session_client_mock.return_value.get_object.side_effect = error
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
     s3_remote.cmd_list()
-    assert f"{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
+
+    assert stdout_mock.getvalue() == f"@{REF} HEAD\n{SHA1} {REF}\n{SHA2} refs/tags/v1\n\n"
+    # One GET of gitwal.json; the paginated listing over <prefix>/refs is gone.
+    session_client_mock.return_value.list_objects_v2.assert_not_called()
+    assert session_client_mock.return_value.get_object.call_count == 1
 
 
 @patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
-def test_cmd_list_with_head_not_exsting_ref(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(shas=[SHA1])
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/master")}
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
-    s3_remote.cmd_list()
-    assert f"{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
-
-
-@patch("sys.stdout", new_callable=StringIO)
-@patch("boto3.Session.client")
-def test_cmd_list_protected_branch(session_client_mock, stdout_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    session_client_mock.return_value.list_objects_v2.side_effect = create_list_objects_v2_mock(
-        protected=True, shas=[SHA1]
+def test_cmd_list_nested_prefix_reads_the_nested_manifest(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "nested/test_prefix")
+    install_wal(
+        session_client_mock.return_value,
+        wal_manifest({REF: SHA1}, head=REF),
+        key="nested/test_prefix/gitwal.json",
     )
 
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(b"refs/heads/%b" % str.encode(BRANCH))}
-    assert s3_remote.bucket == "test_bucket"
-    assert s3_remote.prefix == "test_prefix"
-    assert s3_remote.s3 == session_client_mock.return_value
-    session_client_mock.assert_any_call("s3")
     s3_remote.cmd_list()
-    assert f"@refs/heads/{BRANCH} HEAD\n{SHA1} refs/heads/{BRANCH}\n\n" == stdout_mock.getvalue()
+
+    assert stdout_mock.getvalue() == f"@{REF} HEAD\n{SHA1} {REF}\n\n"
 
 
-@patch("git_remote_s3.git.unbundle")
+@patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
-def test_cmd_fetch(session_client_mock, unbundle_mock):
+def test_cmd_list_of_a_repo_that_does_not_exist_lists_nothing(session_client_mock, stdout_mock):
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
+    install_wal(session_client_mock.return_value)
 
-    unbundle_mock.assert_called_once()
-    assert session_client_mock.return_value.download_file.call_count == 1
+    s3_remote.cmd_list()
+
+    assert stdout_mock.getvalue() == "\n"
 
 
-@patch("git_remote_s3.git.unbundle")
+@patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
-def test_cmd_fetch_same_ref(session_client_mock, unbundle_mock):
+def test_cmd_list_without_a_head_advertises_refs_only(session_client_mock, stdout_mock):
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-    unbundle_mock.assert_called_once()
-    assert session_client_mock.return_value.download_file.call_count == 1
+    install_wal(session_client_mock.return_value, wal_manifest({REF: SHA1}))
+
+    s3_remote.cmd_list()
+
+    assert stdout_mock.getvalue() == f"{SHA1} {REF}\n\n"
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_list_with_a_head_naming_no_ref_advertises_refs_only(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    install_wal(session_client_mock.return_value, wal_manifest({REF: SHA1}, head="refs/heads/master"))
+
+    s3_remote.cmd_list()
+
+    assert stdout_mock.getvalue() == f"{SHA1} {REF}\n\n"
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_list_for_push_reads_the_same_manifest_without_the_symref(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    install_wal(session_client_mock.return_value, wal_manifest({REF: SHA1}, head=REF))
+
+    s3_remote.cmd_list(for_push=True)
+
+    assert stdout_mock.getvalue() == f"{SHA1} {REF}\n\n"
+    assert session_client_mock.return_value.get_object.call_count == 1
+
+
+@patch("sys.stdout", new_callable=StringIO)
+@patch("boto3.Session.client")
+def test_cmd_list_advertises_a_protected_ref_like_any_other(session_client_mock, stdout_mock):
+    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    install_wal(session_client_mock.return_value, wal_manifest({REF: SHA1}, head=REF, protected=[REF]))
+
+    s3_remote.cmd_list()
+
+    assert stdout_mock.getvalue() == f"@{REF} HEAD\n{SHA1} {REF}\n\n"
 
 
 @patch("sys.stdout", new_callable=StringIO)
@@ -384,45 +222,6 @@ def test_unbundle_progress_flag(run_mock):
     run_mock.reset_mock()
     git.unbundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}")
     assert "--progress" not in run_mock.call_args[0][0]
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_cmd_fetch_threads_progress_to_unbundle(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.progress = True
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-
-    assert unbundle_mock.call_args.kwargs["progress"] is True
-    assert session_client_mock.return_value.download_file.call_args.kwargs["Callback"] is not None
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_cmd_fetch_no_progress_passes_no_callback(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-
-    assert unbundle_mock.call_args.kwargs["progress"] is False
-    assert session_client_mock.return_value.download_file.call_args.kwargs["Callback"] is None
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_cmd_fetch_removes_temp_dir(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    created_dirs = []
-
-    def unbundle_side_effect(folder: str, sha: str, ref: str, **kwargs):
-        created_dirs.append(folder)
-
-    unbundle_mock.side_effect = unbundle_side_effect
-
-    s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-
-    assert len(created_dirs) == 1
-    assert not os.path.exists(created_dirs[0])
 
 
 @patch("sys.stdout", new_callable=StringIO)
@@ -542,37 +341,6 @@ def test_transfer_progress_without_total_adapts_to_seen_bytes(stderr_mock):
     assert "10 KiB" in stderr_mock.getvalue()
 
 
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_process_fetch_cmds_single_ref_shows_progress(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.progress = True
-
-    s3_remote.process_fetch_cmds([f"fetch {SHA1} refs/heads/{BRANCH}"])
-
-    assert unbundle_mock.call_args.kwargs["progress"] is True
-    assert session_client_mock.return_value.download_file.call_args.kwargs["Callback"] is not None
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_process_fetch_cmds_multi_ref_suppresses_progress(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    s3_remote.progress = True
-
-    s3_remote.process_fetch_cmds(
-        [
-            f"fetch {SHA1} refs/heads/{BRANCH}",
-            f"fetch {SHA2} refs/heads/other",
-        ]
-    )
-
-    for call in unbundle_mock.call_args_list:
-        assert call.kwargs["progress"] is False
-    for call in session_client_mock.return_value.download_file.call_args_list:
-        assert call.kwargs["Callback"] is None
-
-
 @patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
 def test_cmd_option_cas_records_an_expect_absent_lease(session_client_mock, stdout_mock):
@@ -584,32 +352,6 @@ def test_cmd_option_cas_records_an_expect_absent_lease(session_client_mock, stdo
 
     assert stdout_mock.getvalue() == "ok\nok\n"
     assert s3_remote.cas_refs == {f"refs/heads/{BRANCH}": "", "refs/heads/other": ""}
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_process_fetch_cmds_raises_the_first_failure_after_the_batch(session_client_mock, unbundle_mock):
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-
-    def download_file(*, Key, **kwargs):
-        if SHA2 in Key:
-            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
-
-    session_client_mock.return_value.download_file.side_effect = download_file
-
-    with pytest.raises(NotAuthorizedError):
-        s3_remote.process_fetch_cmds(
-            [
-                f"fetch {SHA1} refs/heads/{BRANCH}",
-                f"fetch {SHA2} refs/heads/other",
-                f"fetch {MOVED_SHA} refs/heads/third",
-            ]
-        )
-
-    # The healthy fetches are not cancelled; only the batch's verdict changes.
-    assert SHA1 in s3_remote.fetched_refs
-    assert MOVED_SHA in s3_remote.fetched_refs
-    assert SHA2 not in s3_remote.fetched_refs
 
 
 @patch("sys.stdout", new_callable=StringIO)
@@ -660,7 +402,7 @@ class NoSuchKey(ClientError):
     pass
 
 
-class _Exceptions:
+class S3Exceptions:
     NoSuchKey = NoSuchKey
     ClientError = ClientError
 
@@ -677,12 +419,14 @@ class ManifestStore:
     competing client would have.
     """
 
-    def __init__(self, client, manifest=None, put_results=()):
+    def __init__(self, client, manifest=None, put_results=(), key="test_prefix/gitwal.json"):
+        self.client = client
+        self.key = key
         self.doc = gitwal.dump(manifest) if manifest is not None else None
         self.etag = '"etag-0"'
         self.put_results = list(put_results)
         self.puts = []
-        client.exceptions = _Exceptions
+        client.exceptions = S3Exceptions
         # No STS identity by default: entry provenance is best-effort, and a test that cares
         # about it says so.
         client.get_caller_identity.return_value = {}
@@ -690,7 +434,7 @@ class ManifestStore:
         client.put_object.side_effect = self._put_object
 
     def _get_object(self, Bucket, Key):
-        assert Key == "test_prefix/gitwal.json"
+        assert Key == self.key
         if self.doc is None:
             raise client_error("NoSuchKey", NoSuchKey)
         return {"Body": BytesIO(self.doc.encode("utf-8")), "ETag": self.etag}
@@ -722,8 +466,8 @@ def wal_manifest(refs=None, *, head=None, protected=(), entries=(), seq=7):
     return gitwal.Manifest(seq=seq, head=head, refs=dict(refs or {}), protected=list(protected), entries=list(entries))
 
 
-def install_wal(client, manifest=None, put_results=()):
-    return ManifestStore(client, manifest=manifest, put_results=put_results)
+def install_wal(client, manifest=None, put_results=(), key="test_prefix/gitwal.json"):
+    return ManifestStore(client, manifest=manifest, put_results=put_results, key=key)
 
 
 def fake_pack(objects=3):
@@ -736,11 +480,6 @@ def fake_pack(objects=3):
         return git.Pack(path=path, checksum=sha, bytes=os.path.getsize(path), objects=objects)
 
     return build
-
-
-@pytest.fixture(autouse=True)
-def _no_cas_backoff(monkeypatch):
-    monkeypatch.setattr(walstore.time, "sleep", lambda _seconds: None)
 
 
 def uploads(client_mock):
@@ -1128,6 +867,9 @@ def test_cmd_push_delete_drops_the_ref_in_a_refs_only_cas(session_client_mock, p
     assert manifest.protected == []
     # A delete reclaims no storage: the pack it uniquely held stays until compaction.
     assert [e.pack for e in manifest.entries] == [f"packs/{SHA1}.pack"]
+    # One CAS, one seq bump: a delete-only batch must not also apply an empty push.
+    assert len(store.puts) == 1
+    assert manifest.seq == 8
     client.delete_object.assert_not_called()
     pack_objects_mock.assert_not_called()
 
@@ -1660,3 +1402,282 @@ def test_pack_objects_reports_an_empty_pack(tmp_path, monkeypatch):
 
     assert pack.objects == 0
     assert pack.bytes == 32
+
+
+REMOTE_URL = "s3://test_bucket/test_prefix"
+SEQ_KEY = "remote.origin.gitwal-seq"
+REGION_KEY = "remote.origin.s3region"
+
+
+@pytest.fixture
+def git_config(monkeypatch):
+    """Stands in for the repo-local git config the region and imported-seq caches live in."""
+    values = {REGION_KEY: "us-east-1"}
+    monkeypatch.setattr(remote_module, "_git_config_get", values.get)
+
+    def run(*args):
+        if "--unset" in args:
+            values.pop(args[-1], None)
+        else:
+            values[args[-2]] = args[-1]
+
+    monkeypatch.setattr(remote_module, "_git_config_run", run)
+    monkeypatch.setattr(remote_module, "maybe_install_lfs_agent", lambda remote_name: None)
+    return values
+
+
+def log_entry(seq, sha, *, size=100):
+    return gitwal.Entry(seq=seq, pack=f"packs/{sha}.pack", bytes=size, objects=2, tips={REF: sha})
+
+
+def fetch_remote(remote_name="origin"):
+    return S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix", remote_name=remote_name, remote_url=REMOTE_URL)
+
+
+def downloaded(client):
+    return [call.kwargs["Key"] for call in client.download_file.call_args_list]
+
+
+THREE_ENTRIES = [log_entry(1, SHA1), log_entry(2, SHA2), log_entry(3, MOVED_SHA)]
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_fetch_imports_only_the_entries_above_the_high_water_mark(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+    git_config[SEQ_KEY] = "2"
+
+    fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert downloaded(client) == [f"test_prefix/packs/{MOVED_SHA}.pack"]
+    assert index_pack_mock.call_count == 1
+    assert git_config[SEQ_KEY] == "3"
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_a_fresh_clone_imports_every_entry(session_client_mock, index_pack_mock, resolves_mock, git_config):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+
+    fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert downloaded(client) == [
+        f"test_prefix/packs/{SHA1}.pack",
+        f"test_prefix/packs/{SHA2}.pack",
+        f"test_prefix/packs/{MOVED_SHA}.pack",
+    ]
+    assert index_pack_mock.call_count == 3
+    assert git_config[SEQ_KEY] == "3"
+
+
+@patch("git_remote_s3.git.has_complete_history")
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_a_stale_mark_self_corrects_by_pulling_older_entries(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    # `git gc --prune` dropped objects the mark says are already here, so nothing is above it and
+    # the first verification fails. The fallback walks the log backwards until the tip resolves.
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+    git_config[SEQ_KEY] = "3"
+    resolves_mock.side_effect = [False, False, True]
+
+    fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert downloaded(client) == [
+        f"test_prefix/packs/{MOVED_SHA}.pack",
+        f"test_prefix/packs/{SHA2}.pack",
+    ]
+    assert git_config[SEQ_KEY] == "3"
+
+
+@patch("git_remote_s3.git.has_complete_history")
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_a_mark_above_a_compacted_log_still_imports_the_base_entry(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    # Compaction replaced the log with one base entry, so the recorded seq names an entry that no
+    # longer exists and nothing is newer than it.
+    base = gitwal.Entry(seq=9, kind=gitwal.KIND_BASE, pack=f"packs/{SHA1}.pack", bytes=500, tips={REF: MOVED_SHA})
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=[base], seq=9))
+    git_config[SEQ_KEY] = "42"
+    resolves_mock.side_effect = [False, True]
+
+    fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert downloaded(client) == [f"test_prefix/packs/{SHA1}.pack"]
+    assert git_config[SEQ_KEY] == "9"
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=False)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_a_tip_that_never_resolves_fails_and_records_no_mark(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+
+    with pytest.raises(FetchIncompleteError) as e:
+        fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert MOVED_SHA in str(e.value)
+    # Every entry was pulled before giving up, and the mark stays unwritten.
+    assert len(downloaded(client)) == 3
+    assert SEQ_KEY not in git_config
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_the_batch_imports_the_union_of_the_wanted_shas_once(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA, OTHER_REF: SHA2}, entries=THREE_ENTRIES))
+
+    fetch_remote().process_fetch_cmds(
+        [f"fetch {MOVED_SHA} {REF}", f"fetch {SHA2} {OTHER_REF}", f"fetch {MOVED_SHA} refs/heads/third"]
+    )
+
+    # One manifest read and one import over the whole batch, not one per ref.
+    assert len(downloaded(client)) == 3
+    assert resolves_mock.call_args_list[0].args == (MOVED_SHA,)
+    assert [c.args[0] for c in resolves_mock.call_args_list] == [MOVED_SHA, SHA2]
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_the_batch_renders_one_progress_meter_over_every_pack(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+    s3_remote = fetch_remote()
+    s3_remote.progress = True
+
+    s3_remote.process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    callbacks = {call.kwargs["Callback"] for call in client.download_file.call_args_list}
+    assert len(callbacks) == 1
+    meter = callbacks.pop()
+    assert meter is not None
+    # The entries carry their own byte counts, so the meter has a total without a HEAD per pack.
+    assert meter.total_bytes == 300
+    assert index_pack_mock.call_args.kwargs["progress"] is True
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_fetch_without_progress_passes_no_callback(session_client_mock, index_pack_mock, resolves_mock, git_config):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: SHA1}, entries=[log_entry(1, SHA1)]))
+
+    fetch_remote().cmd_fetch(f"fetch {SHA1} {REF}")
+
+    assert client.download_file.call_args.kwargs["Callback"] is None
+    assert index_pack_mock.call_args.kwargs["progress"] is False
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_fetch_from_a_repo_with_no_manifest_does_nothing(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client)
+
+    fetch_remote().process_fetch_cmds([f"fetch {SHA1} {REF}"])
+
+    client.download_file.assert_not_called()
+    index_pack_mock.assert_not_called()
+    assert SEQ_KEY not in git_config
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_fetch_reports_a_missing_read_permission(session_client_mock, index_pack_mock, resolves_mock, git_config):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: SHA1}, entries=[log_entry(1, SHA1)]))
+    client.download_file.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+
+    with pytest.raises(NotAuthorizedError):
+        fetch_remote().process_fetch_cmds([f"fetch {SHA1} {REF}"])
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_a_url_only_invocation_imports_but_caches_no_mark(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    # git passes the URL as argv[1] for a push or fetch against a raw URL; there is no remote
+    # section to cache the mark under, so the import runs every time from seq 0.
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: SHA1}, entries=[log_entry(1, SHA1)]))
+
+    fetch_remote(remote_name=REMOTE_URL).process_fetch_cmds([f"fetch {SHA1} {REF}"])
+
+    assert len(downloaded(client)) == 1
+    assert SEQ_KEY not in git_config
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_an_unreadable_mark_is_treated_as_a_fresh_clone(
+    session_client_mock, index_pack_mock, resolves_mock, git_config
+):
+    client = session_client_mock.return_value
+    install_wal(client, wal_manifest({REF: MOVED_SHA}, entries=THREE_ENTRIES))
+    git_config[SEQ_KEY] = "not-a-number"
+
+    fetch_remote().process_fetch_cmds([f"fetch {MOVED_SHA} {REF}"])
+
+    assert len(downloaded(client)) == 3
+    assert git_config[SEQ_KEY] == "3"
+
+
+@patch("boto3.Session.client")
+def test_fetch_of_an_empty_batch_touches_nothing(session_client_mock, git_config):
+    client = session_client_mock.return_value
+
+    fetch_remote().process_fetch_cmds([])
+
+    client.get_object.assert_not_called()
+    client.download_file.assert_not_called()
+
+
+def test_index_pack_imports_a_real_pack_into_the_object_database(tmp_path, monkeypatch):
+    origin = _make_origin(tmp_path)
+    source = _clone(origin, tmp_path / "source")
+    monkeypatch.chdir(source)
+    tip = git.rev_parse("refs/heads/main")
+    folder = tmp_path / "packs"
+    folder.mkdir()
+    pack = git.pack_objects(folder=str(folder), sha=tip, quiet=True)
+
+    empty = tmp_path / "empty"
+    subprocess.run(["git", "init", "-q", str(empty)], check=True, stdout=subprocess.DEVNULL)
+    monkeypatch.chdir(empty)
+    assert git.has_complete_history(tip) is False
+
+    git.index_pack(path=pack.path)
+
+    assert git.has_complete_history(tip) is True
+    # A pack, not an explosion of loose objects.
+    assert os.listdir(".git/objects/pack")
+    assert sorted(os.listdir(".git/objects")) == ["info", "pack"]

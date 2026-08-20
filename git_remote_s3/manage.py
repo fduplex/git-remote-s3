@@ -26,6 +26,8 @@ from botocore.exceptions import (
     UnknownCredentialError,
 )
 from .git import get_remote_url, GitError
+from . import gitwal
+from .walstore import WalStore
 import datetime
 
 # Doctor's stale-lock sweep outlives the push path's lock, which the WAL manifest replaced.
@@ -278,13 +280,18 @@ class Doctor:
 
 
 class ManageBranch:
+    """Branch operations that are all the same thing under the WAL: one conditional manifest PUT."""
+
     def __init__(self, profile, bucket, prefix, branch) -> None:
         self.bucket = bucket
         self.prefix = prefix
         session = boto3.Session(profile_name=profile)
         self.s3 = register_s3_access_grants(session.client("s3", **s3_region_kwargs(session, bucket)), session)
         self.branch = branch
-        if not self.get_branch_content():
+        self.ref = f"refs/heads/{branch}"
+        self.wal = WalStore(self.s3, bucket=bucket, prefix=prefix)
+        manifest, _etag = self.wal.load()
+        if manifest is None or self.ref not in manifest.refs:
             raise ValueError(f"Branch {self.branch} does not exist")
 
     def process_cmd(self, cmd):
@@ -296,33 +303,21 @@ class ManageBranch:
             self.unprotect_branch()
 
     def delete_branch(self):
-        objs = self.get_branch_content()
         resp = input(f"Delete {self.branch} branch [yes/no]: ")
-        if resp.lower() == "yes":
-            for o in objs:
-                self.s3.delete_object(Bucket=self.bucket, Key=o["Key"])
-            print(f"Branch {self.branch} has been deleted")
-        else:
+        if resp.lower() != "yes":
             print("Aborted")
-
-    def get_branch_content(self) -> list[dict]:
-        objs = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=f"{self.prefix}/refs/heads/{self.branch}/").get(
-            "Contents", []
-        )
-        return objs
+            return
+        # Refs-only CAS: the objects this branch uniquely held stay in their packs until the repo
+        # is compacted. Delete-branch no longer reclaims storage on its own.
+        self.wal.update(lambda manifest: gitwal.apply_delete(manifest, ref=self.ref))
+        print(f"Branch {self.branch} has been deleted")
 
     def protect_branch(self):
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=f"{self.prefix}/refs/heads/{self.branch}/PROTECTED#",
-        )
+        self.wal.update(lambda manifest: gitwal.apply_protect(manifest, ref=self.ref))
         print(f"Branch {self.branch} is now protected")
 
     def unprotect_branch(self):
-        self.s3.delete_object(
-            Bucket=self.bucket,
-            Key=f"{self.prefix}/refs/heads/{self.branch}/PROTECTED#",
-        )
+        self.wal.update(lambda manifest: gitwal.apply_unprotect(manifest, ref=self.ref))
         print(f"Branch {self.branch} is now unprotected")
 
 

@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from git_remote_s3 import common
+from git_remote_s3 import common, walstore
 
 
 def pytest_configure(config):
@@ -42,6 +42,14 @@ def git_config_get(key: str) -> str | None:
     if res.returncode != 0:
         return None
     return res.stdout.decode("utf-8").strip() or None
+
+
+@pytest.fixture(autouse=True)
+def _no_cas_backoff(monkeypatch):
+    # The CAS retry loop sleeps between attempts; no test needs to wait for real contention.
+    # Stubbed on the method, not on time.sleep: walstore.time is the time module itself, so
+    # patching its sleep would silently disarm every other sleep in the process.
+    monkeypatch.setattr(walstore.WalStore, "_backoff", lambda self, attempt: None)
 
 
 @pytest.fixture(autouse=True)

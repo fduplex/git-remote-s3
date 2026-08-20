@@ -1,14 +1,15 @@
 import os
 import subprocess
-from io import StringIO
+from io import BytesIO, StringIO
 from unittest.mock import patch
 
 import pytest
 from botocore.exceptions import ClientError
 
 from conftest import git_config_get as _config_get
-from git_remote_s3 import S3Remote, UriScheme
+from git_remote_s3 import S3Remote, UriScheme, gitwal
 from git_remote_s3.remote import BucketNotFoundError, NotAuthorizedError
+from remote_test import S3Exceptions
 
 BUCKET = "test_bucket"
 PREFIX = "test_prefix"
@@ -118,15 +119,16 @@ def test_stale_cached_region_is_dropped_and_the_call_retried(client_mock, config
     config_get.side_effect = config.get
     config_run.side_effect = lambda *args: config.pop(args[-1], None) if "--unset" in args else None
     client = client_mock.return_value
+    client.exceptions = S3Exceptions
     client.head_bucket.return_value = {"BucketRegion": "eu-west-1"}
-    client.list_objects_v2.side_effect = [
-        ClientError({"Error": {"Code": code}}, "ListObjectsV2"),
-        {"Contents": []},
+    client.get_object.side_effect = [
+        ClientError({"Error": {"Code": code}}, "GetObject"),
+        {"Body": BytesIO(gitwal.dump(gitwal.Manifest()).encode("utf-8")), "ETag": '"etag"'},
     ]
 
     remote = _remote(remote_name="origin", remote_url=URL)
 
-    assert remote.list_refs(bucket=BUCKET, prefix=PREFIX) == []
+    assert remote.list_refs().refs == {}
     assert config_run.call_args_list[0].args == ("--local", "--unset", REGION_KEY)
     client_mock.assert_any_call("s3", region_name="eu-west-1")
 
@@ -137,33 +139,40 @@ def test_stale_cached_region_is_dropped_and_the_call_retried(client_mock, config
 @patch("boto3.Session.client")
 def test_unrelated_client_error_is_not_retried(client_mock, config_get, config_run, install_mock):
     client = client_mock.return_value
-    client.list_objects_v2.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+    client.exceptions = S3Exceptions
+    client.get_object.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
 
     with pytest.raises(NotAuthorizedError):
-        _remote(remote_name="origin", remote_url=URL).list_refs(bucket=BUCKET, prefix=PREFIX)
+        _remote(remote_name="origin", remote_url=URL).list_refs()
 
     config_run.assert_not_called()
-    assert client.list_objects_v2.call_count == 1
+    assert client.get_object.call_count == 1
 
 
 @patch("boto3.Session.client")
 def test_no_authz_probe_before_the_first_list(client_mock, capsys):
     client = client_mock.return_value
-    client.list_objects_v2.return_value = {"Contents": []}
+    client.exceptions = S3Exceptions
+    client.get_object.return_value = {
+        "Body": BytesIO(gitwal.dump(gitwal.Manifest()).encode("utf-8")),
+        "ETag": '"etag"',
+    }
 
     remote = _remote()
     remote._ensure_s3()
-    client.list_objects_v2.assert_not_called()
+    client.get_object.assert_not_called()
 
     remote.cmd_list()
 
-    assert [c.kwargs["Prefix"] for c in client.list_objects_v2.call_args_list] == [f"{PREFIX}/refs"]
+    # One GET of the manifest is the whole ref inventory.
+    assert [c.kwargs["Key"] for c in client.get_object.call_args_list] == [f"{PREFIX}/gitwal.json"]
 
 
 @patch("boto3.Session.client")
 def test_missing_bucket_reported_from_the_list_path(client_mock):
     client = client_mock.return_value
-    client.list_objects_v2.side_effect = ClientError({"Error": {"Code": "NoSuchBucket"}}, "ListObjectsV2")
+    client.exceptions = S3Exceptions
+    client.get_object.side_effect = ClientError({"Error": {"Code": "NoSuchBucket"}}, "GetObject")
 
     with pytest.raises(BucketNotFoundError) as e:
         _remote().cmd_list()
@@ -174,12 +183,13 @@ def test_missing_bucket_reported_from_the_list_path(client_mock):
 @patch("boto3.Session.client")
 def test_missing_permission_reported_from_the_list_path(client_mock):
     client = client_mock.return_value
-    client.list_objects_v2.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+    client.exceptions = S3Exceptions
+    client.get_object.side_effect = ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
 
     with pytest.raises(NotAuthorizedError) as e:
         _remote().cmd_list()
 
-    assert str(e.value) == f"Not authorized to perform ListObjectsV2 on the S3 bucket {BUCKET}."
+    assert str(e.value) == f"Not authorized to perform GetObject on the S3 bucket {BUCKET}."
 
 
 @patch("boto3.Session.client")

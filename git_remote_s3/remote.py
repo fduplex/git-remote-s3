@@ -15,7 +15,6 @@ from botocore.exceptions import (
     NoCredentialsError,
     UnknownCredentialError,
 )
-import re
 import shutil
 import subprocess
 import tempfile
@@ -62,6 +61,11 @@ if "remote" in __name__:
 # Bucket region, cached per remote in the repo's local git config so the HeadBucket probe is only
 # paid once per clone. Documented in the README, including how to drop it if the bucket moves.
 _REGION_CONFIG_KEY = "remote.{remote_name}.s3region"
+
+# Highest manifest entry seq imported into this clone, cached in the same repo-local git config.
+# A hint only: every fetch verifies what it imported and pulls older entries when the tip does not
+# resolve, so a stale, corrupt or post-compaction value costs a round trip, never correctness.
+_SEQ_CONFIG_KEY = "remote.{remote_name}.gitwal-seq"
 
 # S3 answers a request aimed at the wrong region with one of these. A region-agnostic client is
 # redirected; a client pinned to the wrong region instead fails to verify the SigV4 scope and
@@ -140,6 +144,17 @@ class NotAuthorizedError(Exception):
         self.bucket = bucket
         self.action = action
         super().__init__(f"Not authorized to perform {action} on the S3 bucket {bucket}.")
+
+
+class FetchIncompleteError(Exception):
+    """Every entry in the log was imported and the wanted shas still do not resolve."""
+
+    def __init__(self, shas: list[str]):
+        self.shas = shas
+        super().__init__(
+            f"the remote's packs do not contain the whole history of {', '.join(shas)}. "
+            "Run git-s3 doctor against the remote."
+        )
 
 
 class Mode:
@@ -292,12 +307,11 @@ class S3Remote:
         # remote; only a real remote name has a config section to cache the bucket region under.
         named_remote = remote_name is not None and remote_name != remote_url and "://" not in remote_name
         self._region_config_key = _REGION_CONFIG_KEY.format(remote_name=remote_name) if named_remote else None
+        self._seq_config_key = _SEQ_CONFIG_KEY.format(remote_name=remote_name) if named_remote else None
         self._is_shallow: bool | None = None
         self.mode = None
         self.progress = False
         self.verbosity = 1
-        self.fetched_refs = []
-        self.fetched_refs_lock = Lock()  # Lock for thread-safe access to fetched_refs
         self.push_cmds = []
         self.fetch_cmds = []  # Store fetch commands for batch processing
         # <remote ref> -> sha git leased the ref against, from `option cas` (--force-with-lease).
@@ -386,6 +400,8 @@ class S3Remote:
         if self._region_config_key:
             _git_config_run("--local", "--unset", self._region_config_key)
         self._s3 = self._build_s3_client()
+        # The store holds the client it was handed, so it has to be rebuilt around the new one.
+        self._wal = None
         return True
 
     @staticmethod
@@ -394,56 +410,29 @@ class S3Remote:
         if code == "NoSuchBucket":
             raise BucketNotFoundError(bucket) from error
         if code == "AccessDenied":
-            raise NotAuthorizedError("ListObjectsV2", bucket) from error
+            raise NotAuthorizedError("GetObject", bucket) from error
         raise error
 
-    def list_refs(self, *, bucket: str, prefix: str) -> list:
-        """Lists the repo's refs, and is where a bad bucket or missing permission is reported.
+    def list_refs(self) -> gitwal.Manifest | None:
+        """Reads the manifest, and is where a bad bucket or missing permission is reported.
 
-        git sends `list` (or `list for-push`) before any fetch or push, so this is the first S3
-        call of every invocation and carries the friendly error mapping that a dedicated
+        git sends `list` (or `list for-push`) before any fetch or push, so this one GET is the
+        first S3 call of every invocation. It carries the friendly error mapping that a dedicated
         construction-time probe used to do at the cost of an extra round trip, and the one-shot
         retry that corrects a stale cached bucket region.
+
+        Returns:
+            The manifest, or None for a repo that does not exist yet.
         """
-        contents: list = []
         for attempt in range(2):
             try:
-                contents = self._list_ref_objects(bucket=bucket, prefix=prefix)
-                break
+                manifest, _etag = self.wal.load()
+                return manifest
             except ClientError as e:
                 if attempt == 0 and self._retry_without_cached_region(e):
                     continue
-                self._raise_list_error(e, bucket)
-
-        contents.sort(key=lambda x: x["LastModified"])
-        contents.reverse()
-
-        objs = [
-            o["Key"].removeprefix(prefix)[1:]
-            for o in contents
-            if o["Key"].startswith(prefix + "/refs") and o["Key"].endswith(".bundle")
-        ]
-        return objs
-
-    def _list_ref_objects(self, *, bucket: str, prefix: str) -> list:
-        # Scoped to the refs/ subtree server-side: in an LFS-heavy repo the
-        # "lfs/<oid>" keys vastly outnumber refs, so listing the bare repo
-        # prefix would paginate through every LFS object on every push and
-        # fetch. For a bucket-root repo (prefix == "") this scopes to
-        # "/refs"; keys there are written as f"{prefix}/{ref}/..." = "/refs/...",
-        # carrying that same leading slash, so the scoped prefix still matches
-        # them exactly as the bare-prefix filter in list_refs always did.
-        list_prefix = f"{prefix}/refs"
-        res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix)
-        contents = res.get("Contents", [])
-        next_token = res.get("NextContinuationToken", None)
-
-        while next_token:
-            res = self.s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix, ContinuationToken=next_token)
-            contents.extend(res.get("Contents", []))
-            next_token = res.get("NextContinuationToken", None)
-
-        return contents
+                self._raise_list_error(e, self.bucket)
+        return None
 
     @contextlib.contextmanager
     def transfer_progress(self, *, action: str, label: str, total_bytes: int | None = None, show_progress: bool = True):
@@ -459,50 +448,9 @@ class S3Remote:
             if progress is not None:
                 progress.close()
 
-    def cmd_fetch(self, args: str, *, show_progress: bool = True):
-        """Fetches a single ref's bundle and unbundles it.
-
-        Args:
-            args (str): the `fetch <sha> <ref>` command line from git
-            show_progress (bool): render this fetch's transfer progress. Multiple concurrent
-                fetches would otherwise interleave their own `\\r`-updating meters (both the S3
-                download callback and `git bundle unbundle --progress`) into garbled output, so
-                process_fetch_cmds disables it for every fetch in a multi-ref batch.
-        """
-        self._ensure_s3()
-        sha, ref = args.split(" ")[1:]
-        with self.fetched_refs_lock:
-            if sha in self.fetched_refs:
-                return
-        logger.info(f"fetch {sha} {ref}")
-        temp_dir: str | None = None
-        try:
-            temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_fetch_")
-            bundle_path = f"{temp_dir}/{sha}.bundle"
-
-            # The object size is unknown before the transfer starts, so the renderer reports
-            # bytes transferred without a percentage rather than paying for a head_object.
-            with self.transfer_progress(action="Downloading", label=ref, show_progress=show_progress) as progress:
-                self.s3.download_file(
-                    Bucket=self.bucket,
-                    Key=f"{self.prefix}/{ref}/{sha}.bundle",
-                    Filename=bundle_path,
-                    Config=TRANSFER_CONFIG,
-                    Callback=progress,
-                )
-
-            logger.info(f"fetched {bundle_path} {ref}")
-
-            git.unbundle(folder=temp_dir, sha=sha, ref=ref, progress=self.progress and show_progress)
-            with self.fetched_refs_lock:
-                self.fetched_refs.append(sha)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "AccessDenied":
-                raise NotAuthorizedError("GetObject", self.bucket) from e
-            raise e
-        finally:
-            if temp_dir is not None:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+    def cmd_fetch(self, args: str) -> None:
+        """Imports one `fetch <sha> <ref>` line. git batches these; process_fetch_cmds is the path."""
+        self.process_fetch_cmds([args])
 
     def cmd_push(self, args: str) -> str:
         return self.process_push_cmds([args])[0]
@@ -665,7 +613,11 @@ class S3Remote:
                 claimed.add(push.entry.pack)
                 entries.append(push.entry)
 
-        out = gitwal.apply_push(manifest, refs=refs, entry=entries[0] if entries else None, head=head)
+        # A delete-only batch has neither refs nor entries; applying a push there would be an
+        # empty transition that bumps seq for nothing.
+        out = manifest
+        if refs or entries:
+            out = gitwal.apply_push(manifest, refs=refs, entry=entries[0] if entries else None, head=head)
         for entry in entries[1:]:
             out = gitwal.apply_push(out, refs={}, entry=entry)
         for push in accepted:
@@ -801,43 +753,25 @@ class S3Remote:
         sys.stdout.flush()
 
     def cmd_list(self, *, for_push: bool = False):
+        """Advertises the manifest's refs, and its head as the symref, in one GET.
+
+        A repo with no manifest lists nothing, exactly as an empty ref listing did: that is what
+        git reads as "not created yet" on the first push.
+        """
         # Before reading self.bucket: the alias-resolved name is only known once setup has run.
         self._ensure_s3()
-        objs = self.list_refs(bucket=self.bucket, prefix=self.prefix)
-        logger.info(objs)
+        manifest = self.list_refs()
+        logger.info(f"list: {manifest.refs if manifest else 'no manifest'}")
 
-        if not for_push:
-            try:
-                head = self.get_remote_head()
-                logger.info(f"HEAD=[{head}]")
-                for o in objs:
-                    ref = "/".join(o.split("/")[:-1])
-                    if ref == head:
-                        logger.info(f"@{ref} HEAD\n")
-                        sys.stdout.write(f"@{ref} HEAD\n")
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "NoSuchKey":
-                    pass  # ignoring missing HEAD on remote
-
-        for o in [x for x in objs if re.match(".+/.+/.+/[a-f0-9]{40}.bundle", x)]:
-            elements = o.split("/")
-            sha = elements[-1].split(".")[0]
-            sys.stdout.write(f"{sha} {'/'.join(elements[:-1])}\n")
+        if manifest is not None:
+            head = manifest.head
+            if not for_push and head is not None and head in manifest.refs:
+                sys.stdout.write(f"@{head} HEAD\n")
+            for ref in sorted(manifest.refs):
+                sys.stdout.write(f"{manifest.refs[ref]} {ref}\n")
 
         sys.stdout.write("\n")
         sys.stdout.flush()
-
-    def get_remote_head(self) -> str:
-        """Gets the remote head ref
-
-        Returns:
-            str: the remote head ref
-        """
-        head = (
-            self.s3.get_object(Bucket=self.bucket, Key=f"{self.prefix}/HEAD").get("Body").read().decode("utf-8").strip()
-        )
-
-        return head
 
     def cmd_capabilities(self):
         sys.stdout.write("*push\n")
@@ -846,37 +780,102 @@ class S3Remote:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    def process_fetch_cmds(self, cmds):
-        """Process fetch commands in parallel using a thread pool.
+    def process_fetch_cmds(self, cmds: list[str]) -> None:
+        """Imports a whole fetch batch: one manifest read, one import over the union of the shas.
 
-        Args:
-            cmds (list): List of fetch commands to process
+        The refs git asks for are satisfied by the same entry log, so there is nothing to
+        parallelise per ref; the parallelism that matters is over the pack downloads, and one
+        batch means one progress meter rather than N interleaving on the same stderr.
         """
         if not cmds:
             return
+        self._ensure_s3()
+        wanted = list(dict.fromkeys(cmd.split(" ")[1] for cmd in cmds))
+        logger.info(f"fetching {len(wanted)} shas from the manifest")
 
-        logger.info(f"Processing {len(cmds)} fetch commands in parallel")
+        manifest, _etag = self.wal.load()
+        if manifest is None:
+            # Nothing has ever been pushed here; git asked for shas the remote cannot hold.
+            return
+        self._import_entries_for(manifest, wanted)
 
-        # Two or more concurrent fetches each render their own progress meter to the shared
-        # stderr, which garbles into unreadable output, so progress is only shown when there is
-        # exactly one fetch in the batch.
-        show_progress = len(cmds) == 1
+    def _import_entries_for(self, manifest: gitwal.Manifest, wanted: list[str]) -> None:
+        """Imports the entries above the high-water mark, then older ones until the shas resolve.
 
-        # Use a thread pool to process fetch commands in parallel
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Submit all fetch commands to the thread pool
-            futures = [executor.submit(self.cmd_fetch, cmd, show_progress=show_progress) for cmd in cmds]
+        The mark is never trusted. A fresh clone (no mark), a `git gc --prune` that dropped
+        objects, and a compaction that renumbered the log all land in the same fallback: keep
+        pulling entries newest to oldest until `git rev-list --objects` is happy. Only then is the
+        mark written, so an interrupted fetch cannot record history it does not hold.
+        """
+        entries = sorted(manifest.entries, key=lambda e: e.seq)
+        mark = self._imported_seq()
+        older = [e for e in entries if e.seq <= mark]
 
-            # Wait for all fetch commands to complete
-            concurrent.futures.wait(futures)
+        self._import_entries([e for e in entries if e.seq > mark])
+        missing = self._unresolved(wanted)
+        while missing:
+            if not older:
+                raise FetchIncompleteError(missing)
+            entry = older.pop()
+            logger.info(f"{missing[0]} does not resolve yet; falling back to entry {entry.seq}")
+            self._import_entries([entry])
+            missing = self._unresolved(wanted)
 
-            # Every fetch is allowed to finish before the first failure is raised, but a failure
-            # must be raised: git takes a silent batch as a complete one and would leave the refs
-            # that never arrived silently missing. main() maps the known types to a `fatal:` line.
-            for future in futures:
-                future.result()
+        if entries:
+            self._record_imported_seq(entries[-1].seq)
 
-        logger.info(f"Completed processing {len(cmds)} fetch commands in parallel")
+    def _import_entries(self, entries: list[gitwal.Entry]) -> None:
+        """Downloads every entry's pack in parallel, then indexes each into .git/objects/pack/."""
+        if not entries:
+            return
+        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_fetch_")
+        try:
+            label = f"{len(entries)} pack{'' if len(entries) == 1 else 's'}"
+            with self.transfer_progress(
+                action="Downloading", label=label, total_bytes=sum(e.bytes for e in entries) or None
+            ) as progress:
+                paths = self._download_packs(entries, temp_dir, progress)
+            for path in paths:
+                git.index_pack(path=path, progress=self.progress)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _download_packs(self, entries: list[gitwal.Entry], temp_dir: str, progress: Any) -> list[str]:
+        def download(entry: gitwal.Entry) -> str:
+            path = os.path.join(temp_dir, os.path.basename(entry.pack))
+            self.s3.download_file(
+                Bucket=self.bucket,
+                Key=f"{self.prefix}/{entry.pack}",
+                Filename=path,
+                Config=TRANSFER_CONFIG,
+                Callback=progress,
+            )
+            logger.info(f"fetched {entry.pack}")
+            return path
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                return list(executor.map(download, entries))
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "AccessDenied":
+                raise NotAuthorizedError("GetObject", self.bucket) from e
+            raise
+
+    @staticmethod
+    def _unresolved(wanted: list[str]) -> list[str]:
+        return [sha for sha in wanted if not git.has_complete_history(sha)]
+
+    def _imported_seq(self) -> int:
+        """The high-water mark from git config; 0 for a fresh clone or a URL-only invocation."""
+        value = _git_config_get(self._seq_config_key) if self._seq_config_key else None
+        try:
+            return max(0, int(value)) if value else 0
+        except ValueError:
+            return 0
+
+    def _record_imported_seq(self, seq: int) -> None:
+        if self._seq_config_key:
+            _git_config_run("--local", self._seq_config_key, str(seq))
 
     def process_cmd(self, cmd: str):  # noqa: C901
         if cmd.startswith("fetch"):
@@ -910,7 +909,7 @@ class S3Remote:
                 # stale lease must not leak into a later batch.
                 self.cas_refs = {}
             elif self.mode == Mode.FETCH and self.fetch_cmds:
-                logger.info(f"fetching {len(self.fetch_cmds)} refs in parallel")
+                logger.info(f"fetching {len(self.fetch_cmds)} refs in one batch")
                 self.process_fetch_cmds(self.fetch_cmds)
                 self.fetch_cmds = []
             sys.stdout.write("\n")
@@ -972,6 +971,10 @@ def main():
         UnknownCredentialError,
     ) as e:
         sys.stderr.write(f"fatal: invalid credentials {e}\n")
+        sys.stderr.flush()
+        sys.exit(1)
+    except (FetchIncompleteError, git.GitError) as e:
+        sys.stderr.write(f"fatal: {e}\n")
         sys.stderr.flush()
         sys.exit(1)
     except BucketNotFoundError as e:

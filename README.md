@@ -259,6 +259,19 @@ If a bucket ever moves to another region, the cached value goes stale. The helpe
 git config --unset remote.origin.s3region
 ```
 
+### Imported-entry high-water mark
+
+> **Fork addition** (not in upstream awslabs/git-remote-s3): a fetch remembers how far down the manifest's entry log it has already imported.
+
+`remote.<name>.gitwal-seq` records the highest `gitwal.json` entry seq imported into this clone, so a routine fetch downloads only the packs added since. It is a hint, never state: after importing, the client verifies the fetched tips with `git rev-list --objects` and, when they do not resolve, keeps pulling older entries until they do. A stale or hand-edited value costs a round trip, never correctness, and the key is written only after verification passes.
+
+```bash
+git config --get remote.origin.gitwal-seq
+# 43
+```
+
+As with the region cache, a fetch straight to a URI has no remote section to write to and re-imports from the start of the log.
+
 ### S3 Access Grants
 
 > **Fork addition** (not in upstream awslabs/git-remote-s3): the [AWS S3 Access Grants boto3 plugin](https://github.com/awslabs/aws-s3-access-grants-plugin-boto3) is bundled and auto-registered on every S3 client this tool builds — the git remote helper, the `git-lfs-s3` transfer agent, and the `git-s3` management CLI.

@@ -10,7 +10,8 @@ from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import UriScheme
-from git_remote_s3.manage import main, Doctor
+from git_remote_s3.manage import main, Doctor, ManageBranch
+from remote_test import ManifestStore, wal_manifest
 
 
 @pytest.fixture
@@ -284,3 +285,88 @@ def test_doctor_run_healthy_nested_repo_never_prompts(capsys):
     assert "lfs" not in out
     assert "Multiple refs" not in out
     assert "No stale locks found." in out
+
+
+REF = "refs/heads/main"
+OTHER_REF = "refs/heads/dev"
+
+
+def _manage_branch(manifest, branch="main"):
+    """A ManageBranch wired to a stubbed client holding real manifest bytes."""
+    client = MagicMock()
+    with (
+        patch("boto3.Session"),
+        patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
+    ):
+        store = ManifestStore(client, manifest=manifest, key="repo/gitwal.json")
+        return ManageBranch(None, "bucket", "repo", branch), store
+
+
+def test_manage_branch_refuses_a_branch_the_manifest_does_not_name():
+    with pytest.raises(ValueError, match="does not exist"):
+        _manage_branch(wal_manifest({OTHER_REF: SHA1}))
+
+
+def test_manage_branch_refuses_a_repo_with_no_manifest():
+    with pytest.raises(ValueError, match="does not exist"):
+        _manage_branch(None)
+
+
+def test_protect_branch_is_a_cas_update_of_the_manifest():
+    branch, store = _manage_branch(wal_manifest({REF: SHA1}, seq=4))
+
+    branch.protect_branch()
+
+    assert len(store.puts) == 1
+    assert store.puts[0]["IfMatch"] == '"etag-0"'
+    assert store.manifest.protected == [REF]
+    assert store.manifest.seq == 5
+    store.client.delete_object.assert_not_called()
+    store.client.put_object.assert_called_once()
+
+
+def test_unprotect_branch_is_a_cas_update_of_the_manifest():
+    branch, store = _manage_branch(wal_manifest({REF: SHA1}, protected=[REF], seq=4))
+
+    branch.unprotect_branch()
+
+    assert len(store.puts) == 1
+    assert store.manifest.protected == []
+    assert store.manifest.seq == 5
+    store.client.delete_object.assert_not_called()
+
+
+def test_protect_retries_against_a_concurrent_commit():
+    branch, store = _manage_branch(wal_manifest({REF: SHA1}, seq=4))
+    store.put_results = [("PreconditionFailed", lambda s: s.hold(wal_manifest({REF: SHA2, OTHER_REF: SHA1}, seq=9)))]
+
+    branch.protect_branch()
+
+    assert len(store.puts) == 2
+    # The retry protects the ref against whatever the winner committed, not against stale refs.
+    assert store.manifest.refs == {REF: SHA2, OTHER_REF: SHA1}
+    assert store.manifest.protected == [REF]
+    assert store.manifest.seq == 10
+
+
+def test_delete_branch_is_a_refs_only_cas():
+    branch, store = _manage_branch(wal_manifest({REF: SHA1, OTHER_REF: SHA2}, protected=[REF], seq=4))
+
+    with patch("builtins.input", return_value="yes"):
+        branch.delete_branch()
+
+    assert store.manifest.refs == {OTHER_REF: SHA2}
+    assert store.manifest.protected == []
+    # The bytes the branch uniquely held stay in their packs until the repo is compacted.
+    store.client.delete_object.assert_not_called()
+
+
+def test_delete_branch_aborted_writes_nothing():
+    branch, store = _manage_branch(wal_manifest({REF: SHA1}, seq=4))
+
+    with patch("builtins.input", return_value="no"):
+        branch.delete_branch()
+
+    assert store.puts == []
+    assert store.manifest.refs == {REF: SHA1}

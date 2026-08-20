@@ -100,6 +100,45 @@ def _pack_object_count(path: str) -> int:
     return objects
 
 
+def index_pack(*, path: str, progress: bool = False) -> None:
+    """Imports a fetched pack into the local object database.
+
+    ``--stdin`` is what makes git own the pack: it writes both the .pack and its .idx under
+    .git/objects/pack/. `git unpack-objects` would explode the same bytes into loose objects,
+    which for a large pack is an order of magnitude more files and bytes on disk.
+
+    Args:
+        path: the downloaded packfile
+        progress: let git render its own indexing meter on the inherited stderr
+    """
+    args = ["git", "index-pack", "--stdin"]
+    if progress:
+        args.append("-v")
+    with open(path, "rb") as pack:
+        result = subprocess.run(
+            args,
+            stdin=pack,
+            stdout=subprocess.PIPE,
+            stderr=None if progress else subprocess.PIPE,
+        )
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to index {path}")
+
+
+def has_complete_history(sha: str) -> bool:
+    """Whether the whole commit and tree graph reachable from sha is present locally.
+
+    This is the fetch's verification step: the imported-seq high-water mark is a hint, and this
+    is the contradiction that makes the client pull older entries.
+    """
+    result = subprocess.run(
+        ["git", "rev-list", "--objects", sha],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def archive(*, folder: str, ref: str) -> str:
     """Archive the content of the folder into a repo.zip file
 
