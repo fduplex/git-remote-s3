@@ -1,6 +1,6 @@
 [project]
 name = "fduplex-git-remote-s3"
-version = "0.5.1"
+version = "0.6.0"
 description = "A git remote helper for Amazon S3"
 authors = [{ name = "FullDuplex Media", email = "contact@fullduplex.media" }]
 readme = "README.md"
