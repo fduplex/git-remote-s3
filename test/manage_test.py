@@ -11,7 +11,7 @@ from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import UriScheme, git, gitwal
-from git_remote_s3.manage import Compact, Doctor, ManageBranch, main
+from git_remote_s3.manage import Compact, Doctor, ManageBranch, ManageHead, main
 from remote_test import ManifestStore, _clone, _git, _make_origin, wal_manifest
 
 
@@ -574,3 +574,107 @@ def test_delete_branch_aborted_writes_nothing():
 
     assert store.puts == []
     assert store.manifest.refs == {REF: SHA1}
+
+
+def _manage_head(manifest, put_results=()):
+    """A ManageHead wired to a stubbed client holding real manifest bytes."""
+    client = MagicMock()
+    with (
+        patch("boto3.Session"),
+        patch("git_remote_s3.manage.register_s3_access_grants", return_value=client),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite", return_value=client),
+        patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
+    ):
+        store = ManifestStore(client, manifest=manifest, put_results=put_results, key="repo/gitwal.json")
+        return ManageHead(None, "bucket", "repo"), store
+
+
+def test_head_set_is_a_cas_update_naming_the_old_and_new_head(capsys):
+    head, store = _manage_head(wal_manifest({REF: SHA1, OTHER_REF: SHA2}, head=OTHER_REF, seq=4))
+
+    assert head.set("main") == 0
+
+    assert len(store.puts) == 1
+    assert store.puts[0]["IfMatch"] == '"etag-0"'
+    assert store.manifest.head == REF
+    assert store.manifest.seq == 5
+    assert f"HEAD {OTHER_REF} -> {REF}" in capsys.readouterr().out
+
+
+def test_head_set_accepts_a_full_refname(capsys):
+    head, store = _manage_head(wal_manifest({REF: SHA1}, seq=4))
+
+    assert head.set(REF) == 0
+
+    assert store.manifest.head == REF
+    assert "HEAD unset -> refs/heads/main" in capsys.readouterr().out
+
+
+def test_head_set_refuses_a_branch_the_manifest_does_not_name(capsys):
+    head, store = _manage_head(wal_manifest({REF: SHA1}, head=REF, seq=4))
+
+    assert head.set("gone") == 1
+
+    assert "refs/heads/gone does not exist in this repo" in capsys.readouterr().err
+    # A Reject is a decision about state a retry cannot change: no PUT is issued at all.
+    assert store.puts == []
+    assert store.manifest.head == REF
+
+
+def test_head_set_refuses_a_repo_with_no_manifest(capsys):
+    head, store = _manage_head(None)
+
+    assert head.set("main") == 1
+
+    assert "no gitwal.json" in capsys.readouterr().err
+    assert store.puts == []
+
+
+def test_head_without_a_branch_reports_a_resolving_head(capsys):
+    head, store = _manage_head(wal_manifest({REF: SHA1}, head=REF, seq=4))
+
+    assert head.show() == 0
+
+    assert f"HEAD {REF} (resolves)" in capsys.readouterr().out
+    assert store.puts == []
+
+
+def test_head_without_a_branch_reports_an_unresolved_head(capsys):
+    head, _store = _manage_head(wal_manifest({REF: SHA1}, head=OTHER_REF, seq=4))
+
+    assert head.show() == 0
+
+    assert f"HEAD {OTHER_REF} (UNRESOLVED)" in capsys.readouterr().out
+
+
+def test_head_without_a_branch_reports_an_unset_head(capsys):
+    head, _store = _manage_head(wal_manifest({REF: SHA1}, seq=4))
+
+    assert head.show() == 0
+
+    assert "HEAD is unset" in capsys.readouterr().out
+
+
+def test_head_is_wired_to_the_remote(mocked_cli_chain, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["git-s3", "head", "s3://profile@bucket/repo", "mybranch"])
+    with patch("git_remote_s3.manage.ManageHead") as head_cls:
+        head_cls.return_value.set.return_value = 0
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+    assert excinfo.value.code == 0
+    head_cls.assert_called_once_with("profile", "bucket", "repo")
+    head_cls.return_value.set.assert_called_once_with("mybranch")
+    head_cls.return_value.show.assert_not_called()
+
+
+def test_head_without_a_branch_is_a_read(mocked_cli_chain, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["git-s3", "head", "s3://profile@bucket/repo"])
+    with patch("git_remote_s3.manage.ManageHead") as head_cls:
+        head_cls.return_value.show.return_value = 0
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+    assert excinfo.value.code == 0
+    head_cls.return_value.show.assert_called_once_with()
+    head_cls.return_value.set.assert_not_called()

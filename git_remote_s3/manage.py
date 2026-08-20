@@ -440,6 +440,11 @@ class Migrate(_Repo):
             return 1
 
         head = self.read_head()
+        if head is not None and head not in refs:
+            # Importing it verbatim would leave every doctor run warning head_unresolved.
+            print(f"warning: legacy HEAD {head} names no ref; omitting head")
+            print("set one later with: git-s3 head <remote> <branch>")
+            head = None
         protected = self.read_protected()
         print(f"Migrating {self.name}: {len(refs)} refs, HEAD {head or 'unset'}, {len(protected)} protected")
 
@@ -624,6 +629,54 @@ class Migrate(_Repo):
         return 1 if failures else 0
 
 
+def _head_ref(branch: str) -> str:
+    """refs/heads/<name>, from either a short branch name or a full refname."""
+    return f"refs/heads/{branch.removeprefix('refs/heads/')}"
+
+
+class ManageHead(_Repo):
+    """Reads or sets the repo's default branch, the ref a fresh clone checks out."""
+
+    def show(self) -> int:
+        """Prints the current head and whether it resolves. A read: no CAS, no PUT."""
+        manifest, _etag = self.wal.load()
+        if manifest is None:
+            sys.stderr.write("fatal: no gitwal.json in this repo; migrate it before setting a head\n")
+            return 1
+        if manifest.head is None:
+            print(f"{self.name}: HEAD is unset")
+        else:
+            state = "resolves" if manifest.head in manifest.refs else "UNRESOLVED"
+            print(f"{self.name}: HEAD {manifest.head} ({state})")
+        return 0
+
+    def set(self, branch: str) -> int:
+        ref = _head_ref(branch)
+        manifest, _etag = self.wal.load()
+        if manifest is None:
+            sys.stderr.write("fatal: no gitwal.json in this repo; migrate it before setting a head\n")
+            return 1
+
+        previous: list[str | None] = []
+
+        def mutate(current: gitwal.Manifest) -> gitwal.Manifest:
+            # Checked inside the mutator so it is checked against the refs that are committed to,
+            # not against the ones read a moment earlier.
+            if ref not in current.refs:
+                raise Reject(f"{ref} does not exist in this repo")
+            previous.append(current.head)
+            return gitwal.set_head(current, head=ref)
+
+        try:
+            committed = self.wal.update(mutate)
+        except (Reject, WalStoreError, gitwal.ManifestError, ClientError) as x:
+            sys.stderr.write(f"fatal: {x}\n")
+            return 1
+
+        print(f"{self.name}: HEAD {previous[-1] or 'unset'} -> {committed.head}")
+        return 0
+
+
 class ManageBranch(_Repo):
     """Branch operations that are all the same thing under the WAL: one conditional manifest PUT."""
 
@@ -682,13 +735,14 @@ def main():  # noqa: C901
         help="migrate --finalize: confirm the deletion, which cannot be undone",
     )
     # Optional: "doctor" and "compact" don't take a branch; delete-branch/protect/unprotect
-    # validate it's present themselves (see the args.branch is None check below).
+    # validate it's present themselves (see the args.branch is None check below), and "head"
+    # reads the current default branch when it is omitted.
     parser.add_argument(
         "branch",
         type=str,
         nargs="?",
         default=None,
-        help="Branch to delete from the remote",
+        help="Branch to act on: delete, (un)protect, or make the remote's default with head",
     )
     args = parser.parse_args()
     remote = args.remote
@@ -713,6 +767,9 @@ def main():  # noqa: C901
             sys.exit(Compact(profile, bucket, prefix).run())
         if args.command == "migrate":
             sys.exit(Migrate(profile, bucket, prefix, args.finalize, args.yes).run())
+        if args.command == "head":
+            head = ManageHead(profile, bucket, prefix)
+            sys.exit(head.show() if args.branch is None else head.set(args.branch))
         if args.command == "delete-branch" or args.command == "protect" or args.command == "unprotect":
             if args.branch is None:
                 sys.stderr.write("fatal: --branch is required\n")

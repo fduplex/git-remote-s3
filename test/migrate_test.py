@@ -154,6 +154,30 @@ def test_migrate_reads_head_as_absent_when_the_repo_has_none(tmp_path, monkeypat
     assert "head" not in gitwal.load(legacy.store.doc).to_dict()
 
 
+def test_migrate_omits_a_legacy_head_that_names_no_ref(tmp_path, monkeypatch, capsys):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    migrate, legacy, _uploaded = _migrate(tmp_path, _legacy_sizes(refs), head="refs/heads/gone")
+
+    assert migrate.run() == 0
+
+    # Importing it verbatim would leave every doctor run warning head_unresolved.
+    assert legacy.store.manifest.head is None
+    assert "head" not in gitwal.load(legacy.store.doc).to_dict()
+    out = capsys.readouterr().out
+    assert "warning: legacy HEAD refs/heads/gone names no ref; omitting head" in out
+    assert "git-s3 head <remote> <branch>" in out
+
+
+def test_migrate_imports_a_legacy_head_that_resolves(tmp_path, monkeypatch, capsys):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    migrate, legacy, _uploaded = _migrate(tmp_path, _legacy_sizes(refs), head="refs/heads/main")
+
+    assert migrate.run() == 0
+
+    assert legacy.store.manifest.head == "refs/heads/main"
+    assert "names no ref" not in capsys.readouterr().out
+
+
 def test_migrate_refuses_a_ref_carrying_more_than_one_bundle(tmp_path, monkeypatch, capsys):
     _work, refs = _local_repo(tmp_path, monkeypatch)
     sizes = _legacy_sizes(refs)
