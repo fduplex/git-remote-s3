@@ -1,6 +1,9 @@
+import hashlib
 import os
 import re
+import struct
 import subprocess
+import tempfile
 from io import StringIO, BytesIO
 from unittest.mock import patch
 
@@ -1402,6 +1405,82 @@ def test_pack_objects_reports_an_empty_pack(tmp_path, monkeypatch):
 
     assert pack.objects == 0
     assert pack.bytes == 32
+
+
+def test_pack_objects_names_the_pack_by_the_checksum_in_its_own_bytes(tmp_path, monkeypatch):
+    origin = _make_origin(tmp_path)
+    work = _clone(origin, tmp_path / "clone")
+    monkeypatch.chdir(work)
+    tip = git.rev_parse("refs/heads/main")
+
+    folder = tmp_path / "packs"
+    folder.mkdir()
+    pack = git.pack_objects(folder=str(folder), sha=tip, quiet=True)
+
+    written = (folder / f"pack-{pack.checksum}.pack").read_bytes()
+    assert written[-20:].hex() == pack.checksum
+    # The streamed temp name is renamed away, never left behind.
+    assert os.listdir(folder) == [f"pack-{pack.checksum}.pack"]
+    # Still self-contained: it indexes standalone against no object database.
+    subprocess.run(["git", "index-pack", pack.path], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
+
+
+def _other_device(tmp_path):
+    """A scratch dir on a different filesystem from tmp_path, when the box offers one."""
+    for candidate in ("/dev/shm", "/run/shm", os.environ.get("GIT_REMOTE_S3_TEST_OTHER_DEVICE")):
+        if not candidate or not os.path.isdir(candidate) or not os.access(candidate, os.W_OK):
+            continue
+        if os.stat(candidate).st_dev != os.stat(tmp_path).st_dev:
+            return candidate
+    return None
+
+
+def test_pack_objects_writes_to_a_folder_on_another_filesystem(tmp_path, monkeypatch):
+    other = _other_device(tmp_path)
+    if not other:
+        pytest.skip("no second filesystem to pack across")
+    origin = _make_origin(tmp_path)
+    work = _clone(origin, tmp_path / "clone")
+    monkeypatch.chdir(work)
+    tip = git.rev_parse("refs/heads/main")
+
+    with tempfile.TemporaryDirectory(dir=other) as folder:
+        # Prefix mode dies here with EXDEV: git renames its temp pack from beside the repo.
+        pack = git.pack_objects(folder=folder, sha=tip, quiet=True)
+
+        assert pack.path == f"{folder}/pack-{pack.checksum}.pack"
+        assert pack.objects > 0
+        subprocess.run(["git", "index-pack", pack.path], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
+
+
+EMPTY_PACK = b"PACK" + struct.pack(">II", 2, 0)
+EMPTY_PACK += hashlib.sha1(EMPTY_PACK).digest()
+
+
+def test_pack_objects_never_makes_git_rename_across_devices(tmp_path, monkeypatch):
+    """git writes its temp pack beside the repo, so a destination prefix on another filesystem
+    fails the rename with EXDEV. The pack must come over stdout, with no prefix argument."""
+    calls = []
+
+    def fake_run(args, input=None, stdout=None, stderr=None, **kwargs):
+        calls.append(args)
+        stdout.write(EMPTY_PACK)
+        return subprocess.CompletedProcess(args, 0, None, b"")
+
+    monkeypatch.setattr(git.subprocess, "run", fake_run)
+    folder = tmp_path / "packs"
+    folder.mkdir()
+
+    pack = git.pack_objects(folder=str(folder), sha=SHA1, quiet=True)
+    git.pack_all(folder=str(folder), shas=[SHA1, SHA2], quiet=True)
+
+    assert pack.checksum == hashlib.sha1(EMPTY_PACK[:12]).hexdigest()
+    assert pack.path == f"{folder}/pack-{pack.checksum}.pack"
+    for args in calls:
+        assert args[:2] == ["git", "pack-objects"]
+        assert "--stdout" in args
+        # No positional destination: everything past the subcommand is a flag.
+        assert [arg for arg in args[2:] if not arg.startswith("-")] == []
 
 
 REMOTE_URL = "s3://test_bucket/test_prefix"

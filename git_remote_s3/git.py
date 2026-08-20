@@ -2,12 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import re
 import struct
 import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+
+_PACK_HEADER_BYTES = 12
+_PACK_CHECKSUM_BYTES = 20
 
 
 class GitError(Exception):
@@ -81,30 +85,47 @@ def pack_all(*, folder: str, shas: Iterable[str], progress: bool = False, quiet:
 
 
 def _pack(*, folder: str, revs: list[str], subject: str, progress: bool, quiet: bool) -> Pack:
-    args = ["git", "pack-objects", "--revs"]
+    # `--stdout` rather than a `<folder>/pack` prefix: in prefix mode git writes its temp pack
+    # beside the repository and renames it onto the prefix, which fails with EXDEV whenever the
+    # repo and the scratch folder sit on different filesystems (a bind-mounted repo plus /tmp).
+    # Streaming into a file we open ourselves keeps the only rename inside the destination folder.
+    args = ["git", "pack-objects", "--revs", "--stdout"]
     if quiet:
         args.append("-q")
     elif progress:
         args.append("--progress")
-    args.append(f"{folder}/pack")
 
+    incoming = f"{folder}/incoming.pack"
     # As in bundle(): git's progress meter only reaches the user when stderr is inherited, so the
-    # captured text is only available when progress is off.
-    result = subprocess.run(
-        args,
-        input="\n".join(revs).encode("utf8"),
-        stdout=subprocess.PIPE,
-        stderr=None if (progress and not quiet) else subprocess.PIPE,
-    )
+    # captured text is only available when progress is off. The pack itself is on stdout.
+    with open(incoming, "wb") as out:
+        result = subprocess.run(
+            args,
+            input="\n".join(revs).encode("utf8"),
+            stdout=out,
+            stderr=None if (progress and not quiet) else subprocess.PIPE,
+        )
     if result.returncode != 0:
+        os.unlink(incoming)
         raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to pack {subject}")
 
-    lines = [line for line in result.stdout.decode("utf8").split("\n") if line.strip()]
-    if not lines:
+    size = _file_size(incoming)
+    if size < _PACK_HEADER_BYTES + _PACK_CHECKSUM_BYTES:
+        os.unlink(incoming)
         raise GitError(f"git pack-objects wrote no pack for {subject}")
-    checksum = lines[-1].strip()
+
+    checksum = _pack_checksum(incoming)
+    objects = _pack_object_count(incoming)
     path = f"{folder}/pack-{checksum}.pack"
-    return Pack(path=path, checksum=checksum, bytes=_file_size(path), objects=_pack_object_count(path))
+    os.rename(incoming, path)
+    return Pack(path=path, checksum=checksum, bytes=size, objects=objects)
+
+
+def _pack_checksum(path: str) -> str:
+    """Reads the trailing checksum git names the pack by."""
+    with open(path, "rb") as f:
+        f.seek(-_PACK_CHECKSUM_BYTES, 2)
+        return f.read(_PACK_CHECKSUM_BYTES).hex()
 
 
 def _file_size(path: str) -> int:
@@ -116,7 +137,7 @@ def _file_size(path: str) -> int:
 def _pack_object_count(path: str) -> int:
     """Reads the object count out of the 12-byte pack header."""
     with open(path, "rb") as f:
-        signature, _version, objects = struct.unpack(">4sII", f.read(12))
+        signature, _version, objects = struct.unpack(">4sII", f.read(_PACK_HEADER_BYTES))
     if signature != b"PACK":
         raise GitError(f"{path} is not a packfile")
     return objects
