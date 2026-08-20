@@ -2,13 +2,102 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import re
+import struct
 import subprocess
 import sys
-import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 
 class GitError(Exception):
     pass
+
+
+@dataclass
+class Pack:
+    """A packfile built by :func:`pack_objects`, named by the checksum git gave it."""
+
+    path: str
+    checksum: str
+    bytes: int
+    objects: int
+
+
+def has_object(sha: str) -> bool:
+    """Whether the local repo holds this object.
+
+    The remote may name a ref this clone never fetched, and a bare 40-hex string satisfies
+    `rev-parse --verify` on its own, so the object is peeled to force an existence check.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--quiet", "--verify", f"{sha}^{{object}}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def pack_objects(
+    *, folder: str, sha: str, have: Iterable[str] = (), progress: bool = False, quiet: bool = False
+) -> Pack:
+    """Packs everything reachable from sha and not from the shas the remote already holds.
+
+    Not `--thin`: a delta base outside the pack would make the pack unindexable on its own, and
+    every reader of this format (the client, the materializer's dulwich reader) indexes each pack
+    standalone. Shas the local repo does not hold are dropped from the exclusion set rather than
+    failing the push.
+
+    Args:
+        folder: directory to write the pack into
+        sha: the tip being pushed
+        have: candidate exclusions, i.e. the tips the remote manifest already names
+        progress: let git render its own progress meter on the inherited stderr
+        quiet: suppress git's output entirely
+
+    Returns:
+        Pack: the written pack, with objects == 0 when the remote already holds everything.
+    """
+    revs = [sha, *(f"^{h}" for h in have if has_object(h))]
+    args = ["git", "pack-objects", "--revs"]
+    if quiet:
+        args.append("-q")
+    elif progress:
+        args.append("--progress")
+    args.append(f"{folder}/pack")
+
+    # As in bundle(): git's progress meter only reaches the user when stderr is inherited, so the
+    # captured text is only available when progress is off.
+    result = subprocess.run(
+        args,
+        input="\n".join(revs).encode("utf8"),
+        stdout=subprocess.PIPE,
+        stderr=None if (progress and not quiet) else subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to pack {sha}")
+
+    lines = [line for line in result.stdout.decode("utf8").split("\n") if line.strip()]
+    if not lines:
+        raise GitError(f"git pack-objects wrote no pack for {sha}")
+    checksum = lines[-1].strip()
+    path = f"{folder}/pack-{checksum}.pack"
+    return Pack(path=path, checksum=checksum, bytes=_file_size(path), objects=_pack_object_count(path))
+
+
+def _file_size(path: str) -> int:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        return f.tell()
+
+
+def _pack_object_count(path: str) -> int:
+    """Reads the object count out of the 12-byte pack header."""
+    with open(path, "rb") as f:
+        signature, _version, objects = struct.unpack(">4sII", f.read(12))
+    if signature != b"PACK":
+        raise GitError(f"{path} is not a packfile")
+    return objects
 
 
 def archive(*, folder: str, ref: str) -> str:

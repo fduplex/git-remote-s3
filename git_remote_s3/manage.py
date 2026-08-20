@@ -5,7 +5,7 @@
 # Changed: Doctor Access Grants diagnostics, bucket-alias resolution, scoped list prefixes, prefix-relative key parsing.
 
 import boto3
-from .remote import parse_git_url, DEFAULT_LOCK_TTL_SECONDS
+from .remote import parse_git_url
 from .common import (
     resolve_bucket_alias,
     register_s3_access_grants,
@@ -27,6 +27,9 @@ from botocore.exceptions import (
 )
 from .git import get_remote_url, GitError
 import datetime
+
+# Doctor's stale-lock sweep outlives the push path's lock, which the WAL manifest replaced.
+DEFAULT_LOCK_TTL_SECONDS = 60
 
 
 _ACCESS_GRANTS_HINTS = {

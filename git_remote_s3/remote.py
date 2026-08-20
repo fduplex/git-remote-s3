@@ -22,11 +22,14 @@ import tempfile
 import time
 import os
 import concurrent.futures
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, NoReturn
 
 import botocore.exceptions
 from git_remote_s3 import git
+from . import gitwal
 from .enums import UriScheme
 from .common import (
     parse_git_url,
@@ -37,6 +40,7 @@ from .common import (
     BucketAliasError,
     TRANSFER_CONFIG,
 )
+from .walstore import CasExhaustedError, Reject, WalStore
 import botocore
 import contextlib
 
@@ -54,8 +58,6 @@ if "remote" in __name__:
         stream=sys.stderr,
         format="%(name)s: %(levelname)s: %(message)s",
     )
-
-DEFAULT_LOCK_TTL_SECONDS = 60
 
 # Bucket region, cached per remote in the repo's local git config so the HeadBucket probe is only
 # paid once per clone. Documented in the README, including how to drop it if the bucket moves.
@@ -143,6 +145,30 @@ class NotAuthorizedError(Exception):
 class Mode:
     FETCH = "fetch"
     PUSH = "push"
+
+
+_S3_ZIP_DEPRECATION = "git-remote-s3: s3+zip:// is deprecated and now behaves as s3://; no repo.zip archive is written."
+
+
+@dataclass
+class _PushRef:
+    """One `push <src>:<dst>` line, carried from parsing through the batch's single CAS."""
+
+    remote_ref: str
+    local_ref: str | None
+    force: bool
+    sha: str | None = None
+    entry: gitwal.Entry | None = None
+    # The mutator's verdict on its last attempt; set on every attempt because a re-validation
+    # against fresher refs can change it.
+    rejection: str | None = None
+    # The line sent back to git. Empty until this ref is decided, which is what marks a push as
+    # still live after the pre-CAS phase.
+    result: str = ""
+
+    @property
+    def delete(self) -> bool:
+        return self.local_ref is None
 
 
 def maybe_install_lfs_agent(remote_name: str) -> None:
@@ -252,6 +278,8 @@ class S3Remote:
         credentials, do DNS or call S3; all of that is deferred to _ensure_s3.
         """
         self.uri_scheme = uri_scheme
+        if uri_scheme == UriScheme.S3_ZIP:
+            sys.stderr.write(f"{_S3_ZIP_DEPRECATION}\n")
         self.profile = profile
         self.bucket = bucket
         self.prefix = prefix
@@ -274,18 +302,23 @@ class S3Remote:
         self.fetch_cmds = []  # Store fetch commands for batch processing
         # <remote ref> -> sha git leased the ref against, from `option cas` (--force-with-lease).
         self.cas_refs: dict[str, str] = {}
-        self._protected_cache: dict[str, list] = {}
-        # Lock TTL (seconds); can be configured via env var
-        try:
-            self.lock_ttl_seconds = int(os.environ.get("GIT_REMOTE_S3_LOCK_TTL_SECONDS", DEFAULT_LOCK_TTL_SECONDS))
-        except ValueError:
-            self.lock_ttl_seconds = DEFAULT_LOCK_TTL_SECONDS
+        self._wal: WalStore | None = None
+        self._caller_arn: str | None = None
+        self._caller_arn_probed = False
 
     @property
     def s3(self) -> Any:
         """The S3 client, built on first use along with the rest of the AWS setup."""
         self._ensure_s3()
         return self._s3
+
+    @property
+    def wal(self) -> WalStore:
+        """The manifest's CAS store, built once the alias-resolved bucket name is known."""
+        self._ensure_s3()
+        if self._wal is None:
+            self._wal = WalStore(self._s3, bucket=self.bucket, prefix=self.prefix)
+        return self._wal
 
     def _ensure_s3(self) -> None:
         """Pays the one-off AWS setup cost: alias resolution, session, region and client.
@@ -471,261 +504,206 @@ class S3Remote:
             if temp_dir is not None:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def remove_remote_ref(self, remote_ref: str) -> str:
-        logger.info(f"Removing remote ref {remote_ref}")
-        try:
-            objects_to_delete = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/").get(
-                "Contents", []
-            )
-            if (
-                self.uri_scheme == UriScheme.S3
-                and len(objects_to_delete) == 1
-                or self.uri_scheme == UriScheme.S3_ZIP
-                and len(objects_to_delete) == 2
-            ):
-                for object in objects_to_delete:
-                    self.s3.delete_object(Bucket=self.bucket, Key=object["Key"])
-                return f"ok {remote_ref}\n"
-            elif len(objects_to_delete) == 0:
-                return f"error {remote_ref} not found\n"
-            else:
-                return f'error {remote_ref} "multiple bundles exists on server. Run git-s3 doctor to fix."?\n'  # noqa: B950
-
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                logger.info(f"fatal: {remote_ref} not found\n")
-                return f"error {remote_ref} not found\n"
-            raise e
-
     def cmd_push(self, args: str) -> str:
+        return self.process_push_cmds([args])[0]
+
+    def process_push_cmds(self, cmds: list[str]) -> list[str]:
+        """Runs a whole push batch: build and upload every pack, then commit every ref in one CAS.
+
+        Packs are immutable and content-addressed, so uploading them ahead of the commit point can
+        never conflict with anything: a pack whose CAS never lands is an orphan, which the format
+        defines as inert. The single manifest PUT is the commit point, which is what finally makes
+        a multi-ref push atomic.
+        """
         self._ensure_s3()
-        force_push = False
-        local_ref, remote_ref = args.split(" ")[1].split(":")
-        if not local_ref:
-            lease_error = self.delete_lease_violation_error(remote_ref)
-            if lease_error:
-                return lease_error
-            return self.remove_remote_ref(remote_ref)
-        if local_ref.startswith("+"):
-            force_push = True
-            logger.info(f"Force push {force_push}")
-            local_ref = local_ref[1:]
-
-        logger.info(f"push !{local_ref}! !{remote_ref}!")
-
-        # `git bundle create` in a shallow repo emits a bundle with truncated history and no
-        # prerequisites that `git bundle verify` still calls complete, so the breakage would only
-        # surface for whoever clones it next.
-        if self._is_shallow_repository():
-            return f'error {remote_ref} "cannot push from a shallow clone; run git fetch --unshallow first."?\n'
-
-        contents = self.get_bundles_for_ref(remote_ref)
-        if len(contents) > 1:
-            return f'error {remote_ref} "multiple bundles exists on server. Run git-s3 doctor to fix."?\n'  # noqa: B950
+        pushes = [self._parse_push_cmd(cmd) for cmd in cmds]
+        manifest, _etag = self.wal.load()
+        snapshot = manifest if manifest is not None else gitwal.Manifest()
 
         temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
-
-        # Best-effort fast-fail on a non-fast-forward push before we create the bundle and take the
-        # lock. This is only an optimization; the authoritative reconcile happens under the lock
-        # below, off the state read AFTER acquisition.
-        pre_lock_bundle = contents[0]["Key"] if len(contents) == 1 else None
-        sha: str | None = None
-        lock_key: str | None = None
-        result: str | None = None
-        lock_release_error: str | None = None
         try:
-            sha = git.rev_parse(local_ref)
-            pre_lock_sha = pre_lock_bundle.split("/")[-1].split(".")[0] if pre_lock_bundle else None
-            lease_error = self.lease_violation_error(remote_ref=remote_ref, remote_sha=pre_lock_sha)
-            if lease_error:
-                return lease_error
-            if pre_lock_sha is not None and not git.is_ancestor(pre_lock_sha, sha):
-                error = self.non_fast_forward_error(
-                    remote_ref=remote_ref,
-                    local_ref=local_ref,
-                    remote_sha=pre_lock_sha,
-                    force_push=force_push,
-                )
-                if error:
-                    return error
+            for push in pushes:
+                self._prepare_push(push, snapshot, temp_dir)
+            self._commit_pushes([p for p in pushes if not p.result])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-            # Create the bundle before acquiring the lock (local operation)
-            temp_file = git.bundle(
+        return [p.result for p in pushes]
+
+    @staticmethod
+    def _parse_push_cmd(cmd: str) -> _PushRef:
+        local_ref, remote_ref = cmd.split(" ")[1].split(":")
+        force = local_ref.startswith("+")
+        if force:
+            local_ref = local_ref[1:]
+        logger.info(f"push !{local_ref}! !{remote_ref}!")
+        return _PushRef(remote_ref=remote_ref, local_ref=local_ref or None, force=force)
+
+    def _prepare_push(self, push: _PushRef, manifest: gitwal.Manifest, temp_dir: str) -> None:
+        """Resolves the local sha and uploads this ref's pack. Nothing here is a commit point."""
+        local_ref = push.local_ref
+        if local_ref is None:
+            return
+
+        # `git pack-objects` in a shallow repo emits a pack that omits history the receiver may not
+        # have, and the breakage only surfaces for whoever clones it next.
+        if self._is_shallow_repository():
+            push.result = (
+                f'error {push.remote_ref} "cannot push from a shallow clone; run git fetch --unshallow first."?\n'
+            )
+            return
+
+        try:
+            push.sha = git.rev_parse(local_ref)
+            # Fast-fail against the manifest we have already read, so a doomed push does not build
+            # a pack. The authoritative verdict is the identical check inside the CAS mutator.
+            rejection = self._push_rejection(manifest, push)
+            if rejection:
+                push.result = rejection
+                return
+            pack = git.pack_objects(
                 folder=temp_dir,
-                sha=sha,
-                ref=local_ref,
+                sha=push.sha,
+                have=sorted(set(manifest.refs.values())),
                 progress=self.progress,
                 quiet=self.verbosity == 0,
             )
-
-            # Acquire per-ref lock to avoid concurrent writes
-            lock_key = self.acquire_lock(remote_ref)
-            if not lock_key:
-                # Provide clear guidance to the user; include lock path and TTL
-                lock_path = f"{self.prefix}/{remote_ref}/LOCK#.lock"
-                return (
-                    f"error {remote_ref} "
-                    f'"failed to acquire ref lock at {lock_path}. '
-                    f"Another client may be pushing. If this persists beyond {self.lock_ttl_seconds}s, "
-                    f"run git-remote-s3 doctor --lock-ttl {self.lock_ttl_seconds} to inspect and "
-                    f'optionally clear stale locks."?\n'
-                )
-
-            # Authoritative view: reconcile against the bundles that exist NOW, under the lock, not
-            # the pre-lock snapshot. A concurrent push whose pre-lock view was empty must still see
-            # (and reconcile against) a bundle another pusher committed before we acquired the lock,
-            # otherwise both writers would leave a bundle and the ref would end up with two.
-            current_contents = self.get_bundles_for_ref(remote_ref)
-            if len(current_contents) > 1:
-                return (
-                    f'error {remote_ref} "multiple bundles exists for the same ref on server. '
-                    f"Run git-s3 doctor to fix. Upgrade git-remote-s3 to latest version to "
-                    f'prevent this in the future."\n'
-                )
-
-            remote_to_remove = current_contents[0]["Key"] if len(current_contents) == 1 else None
-            remote_sha = remote_to_remove.split("/")[-1].split(".")[0] if remote_to_remove else None
-            lease_error = self.lease_violation_error(remote_ref=remote_ref, remote_sha=remote_sha)
-            if lease_error:
-                return lease_error
-            if remote_sha is not None and not git.is_ancestor(remote_sha, sha):
-                error = self.non_fast_forward_error(
-                    remote_ref=remote_ref,
-                    local_ref=local_ref,
-                    remote_sha=remote_sha,
-                    force_push=force_push,
-                )
-                if error:
-                    return error
-
-            with self.transfer_progress(
-                action="Uploading",
-                label=remote_ref,
-                total_bytes=os.path.getsize(temp_file),
-            ) as progress:
-                self.s3.upload_file(
-                    Filename=temp_file,
-                    Bucket=self.bucket,
-                    Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
-                    Config=TRANSFER_CONFIG,
-                    Callback=progress,
-                )
-
-            # init_remote_head (a HeadObject + maybe PutObject) and removing the stale bundle
-            # are independent of each other, so run them concurrently. Both futures are waited
-            # on before either result is consulted, so a delete failure is never silently
-            # dropped just because the HEAD-init result was checked first; checking
-            # head_future first preserves the same error-priority the sequential code had.
-            if remote_to_remove:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    head_future = executor.submit(self.init_remote_head, remote_ref)
-                    delete_future = executor.submit(self.s3.delete_object, Bucket=self.bucket, Key=remote_to_remove)
-                    concurrent.futures.wait([head_future, delete_future])
-                    head_future.result()
-                    delete_future.result()
-            else:
-                self.init_remote_head(remote_ref)
-            logger.info(f"pushed {temp_file} to {remote_ref}")
-
-            if self.uri_scheme == UriScheme.S3_ZIP:
-                # Create and push a zip archive next to the bundle file
-                # Example use-case: Repo on S3 as Source for AWS CodePipeline
-                commit_msg = git.get_last_commit_message()
-                temp_file_archive = git.archive(folder=temp_dir, ref=local_ref)
-                with self.transfer_progress(
-                    action="Uploading",
-                    label=f"{remote_ref} (zip)",
-                    total_bytes=os.path.getsize(temp_file_archive),
-                ) as progress:
-                    self.s3.upload_file(
-                        Filename=temp_file_archive,
-                        Bucket=self.bucket,
-                        Key=f"{self.prefix}/{remote_ref}/repo.zip",
-                        ExtraArgs={
-                            "Metadata": {"codepipeline-artifact-revision-summary": commit_msg},
-                            "ContentDisposition": f"attachment; filename=repo-{sha[:8]}.zip",
-                        },
-                        Config=TRANSFER_CONFIG,
-                        Callback=progress,
-                    )
-                logger.info(
-                    f"pushed {temp_file_archive} to {self.prefix}/{remote_ref}/repo.zip with message {commit_msg}"
-                )
-
-            result = f"ok {remote_ref}\n"
+            if pack.objects == 0:
+                # Everything this ref names is already on the remote (a tag on an existing commit,
+                # or a ref re-pointed at a sha some other ref already carries): refs-only CAS.
+                logger.info(f"nothing new to pack for {push.remote_ref}")
+                return
+            push.entry = self._upload_pack(push, pack)
         except git.GitError as e:
-            # A bundle that git refuses to build must fail this ref only; letting it escape would
-            # kill the helper and abandon the rest of the batch.
+            # A pack git refuses to build must fail this ref only; letting it escape would kill the
+            # helper and abandon the rest of the batch.
             logger.info(f"fatal: {e}\n")
-            return f'error {remote_ref} "{_single_line(str(e))}"?\n'
+            push.result = f'error {push.remote_ref} "{_single_line(str(e))}"?\n'
         except boto3.exceptions.S3UploadFailedError as e:
             logger.info(f"fatal: {e}\n")
-            return f'error {remote_ref} "{e}"?\n'
+            push.result = f'error {push.remote_ref} "{e}"?\n'
         except botocore.exceptions.ClientError as e:
             logger.info(f"fatal: {e}\n")
-            return f'error {remote_ref} "{e}"?\n'
-        finally:
-            if lock_key:
-                try:
-                    self.release_lock(remote_ref, lock_key)
-                except Exception as e:
-                    logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
-                    lock_release_error = (
-                        f'error {remote_ref} "failed to release lock. You may need to '
-                        f"manually remove the lock {lock_key} from the server or use "
-                        f'git-s3 doctor to fix."?\n'
-                    )
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            push.result = f'error {push.remote_ref} "{e}"?\n'
 
-        return lock_release_error if lock_release_error else result
+    def _upload_pack(self, push: _PushRef, pack: git.Pack) -> gitwal.Entry:
+        """Writes the pack to its content-addressed key and describes it as a log entry.
 
-    def init_remote_head(self, ref: str) -> None:
-        """Initialise the remote HEAD reference if it does not exist
-
-        Args:
-            ref (str): The ref to which the remote HEAD should point to
+        The PUT is unconditional on purpose: the key is the pack's own checksum, so a retry writes
+        identical bytes to an identical key and can never clobber anything.
         """
-
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=f"{self.prefix}/HEAD")
-        except ClientError:
-            self.s3.put_object(
+        relative_key = f"{gitwal.PACKS_PREFIX}/{pack.checksum}.pack"
+        with self.transfer_progress(action="Uploading", label=push.remote_ref, total_bytes=pack.bytes) as progress:
+            self.s3.upload_file(
+                Filename=pack.path,
                 Bucket=self.bucket,
-                Key=f"{self.prefix}/HEAD",
-                Body=ref,
+                Key=f"{self.prefix}/{relative_key}",
+                Config=TRANSFER_CONFIG,
+                Callback=progress,
             )
+        logger.info(f"pushed {pack.path} to {relative_key}")
+        return gitwal.Entry(
+            kind=gitwal.KIND_INCREMENTAL,
+            pack=relative_key,
+            bytes=pack.bytes,
+            objects=pack.objects,
+            tips={push.remote_ref: push.sha} if push.sha else {},
+            by=self._push_identity(),
+            at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
 
-    def get_bundles_for_ref(self, remote_ref: str) -> list[dict]:
-        """Lists all the bundles for a given ref on the remote
+    def _commit_pushes(self, pushes: list[_PushRef]) -> None:
+        """Commits every surviving ref of the batch in one compare-and-swap.
 
-        Args:
-            remote_ref (str): the remote ref
-
-        Returns:
-            list[dict]: the list of bundles objects
+        The mutator re-runs all three validations on every attempt, so a 412 can never commit a
+        decision taken against refs that have since moved. A ref the mutator rejects is dropped
+        from that attempt and reported to git on its own `error <ref>` line, exactly as it was
+        before the CAS existed; the batch as a whole still commits in a single PUT.
         """
+        if not pushes:
+            return
 
-        # We are not implementing pagination since there can be few objects (bundles)
-        # under a single Prefix
-        return [
-            c
-            for c in self.s3.list_objects_v2(Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/").get(
-                "Contents", []
+        def mutate(manifest: gitwal.Manifest) -> gitwal.Manifest:
+            accepted = []
+            for push in pushes:
+                push.rejection = self._push_rejection(manifest, push)
+                if push.rejection is None:
+                    accepted.append(push)
+            if not accepted:
+                raise Reject(f"no ref of this push passed validation against gitwal.json seq {manifest.seq}")
+            return self._apply_pushes(manifest, accepted)
+
+        failure: str | None = None
+        try:
+            self.wal.update(mutate)
+        except Reject:
+            # Every ref carries the mutator's verdict from the attempt that rejected it.
+            pass
+        except (CasExhaustedError, gitwal.ManifestError, botocore.exceptions.ClientError) as e:
+            logger.info(f"fatal: {e}\n")
+            failure = _single_line(str(e))
+
+        for push in pushes:
+            if failure is not None:
+                push.result = f'error {push.remote_ref} "{failure}"?\n'
+            else:
+                push.result = push.rejection or f"ok {push.remote_ref}\n"
+
+    def _apply_pushes(self, manifest: gitwal.Manifest, accepted: list[_PushRef]) -> gitwal.Manifest:
+        """Folds every accepted ref update, entry and deletion of the batch into one manifest."""
+        refs = {p.remote_ref: p.sha for p in accepted if not p.delete and p.sha}
+        # init_remote_head's rule, kept: the first ref pushed to a repo with no default branch
+        # names it, and a repo that already has one is never re-pointed by a push.
+        head = next(iter(refs), None) if manifest.head is None else None
+
+        # Two refs pushed at the same tip produce byte-identical packs, and a pack may only be
+        # named by one entry; the second ref still commits, it just names no new data.
+        claimed = {e.pack for e in manifest.entries}
+        entries = []
+        for push in accepted:
+            if push.entry is not None and push.entry.pack not in claimed:
+                claimed.add(push.entry.pack)
+                entries.append(push.entry)
+
+        out = gitwal.apply_push(manifest, refs=refs, entry=entries[0] if entries else None, head=head)
+        for entry in entries[1:]:
+            out = gitwal.apply_push(out, refs={}, entry=entry)
+        for push in accepted:
+            if push.delete:
+                out = gitwal.apply_delete(out, ref=push.remote_ref)
+        return out
+
+    def _push_rejection(self, manifest: gitwal.Manifest, push: _PushRef) -> str | None:
+        """The lease, fast-forward and protection verdicts for one ref against one manifest.
+
+        Run pre-flight against the manifest read at the start of the batch, and again inside the
+        CAS mutator against whatever state the commit will actually replace.
+        """
+        remote_sha = manifest.refs.get(push.remote_ref)
+        lease_error = self.lease_violation_error(remote_ref=push.remote_ref, remote_sha=remote_sha)
+        if lease_error:
+            return lease_error
+        if push.delete:
+            return None if remote_sha else f"error {push.remote_ref} not found\n"
+        if remote_sha is not None and push.sha is not None and not git.is_ancestor(remote_sha, push.sha):
+            return self.non_fast_forward_error(
+                remote_ref=push.remote_ref,
+                local_ref=push.local_ref or "",
+                remote_sha=remote_sha,
+                force_push=push.force,
+                protected=manifest.is_protected(push.remote_ref),
             )
-            if "PROTECTED#" not in c["Key"]
-            and ".zip" not in c["Key"]
-            and "/LOCKS/" not in c["Key"]
-            and not c["Key"].endswith(".lock")
-        ]
+        return None
 
-    def is_protected(self, remote_ref):
-        # cmd_push consults this on the pre-lock fast-fail and again under the lock; protection is
-        # set out of band by an admin, so one ListObjectsV2 per ref per process is enough.
-        if remote_ref not in self._protected_cache:
-            self._protected_cache[remote_ref] = self.s3.list_objects_v2(
-                Bucket=self.bucket, Prefix=f"{self.prefix}/{remote_ref}/PROTECTED#"
-            ).get("Contents", [])
-        return self._protected_cache[remote_ref]
+    def _push_identity(self) -> str | None:
+        """The caller's STS ARN, for entry provenance. Best effort: never fails a push."""
+        if not self._caller_arn_probed:
+            self._caller_arn_probed = True
+            try:
+                self._caller_arn = self.session.client("sts").get_caller_identity()["Arn"]
+            except Exception as x:
+                logger.info(f"could not resolve the caller identity for the manifest entry: {x}")
+        return self._caller_arn
 
     def _is_shallow_repository(self) -> bool:
         """Caches git's answer, which cannot change while the helper process is alive."""
@@ -758,32 +736,12 @@ class S3Remote:
             f'{leased_sha or "absent"} it was leased against. Fetch first."?\n'
         )
 
-    def delete_lease_violation_error(self, remote_ref: str) -> str | None:
-        """Applies the same lease to a `--force-with-lease --delete`.
-
-        A delete returns from cmd_push before either ancestry site, so it needs its own call. The
-        extra ListObjectsV2 is only paid when a lease was actually taken on this ref.
-
-        Returns:
-            str | None: the error line to send back to git, or None when the delete may proceed
-        """
-        if remote_ref not in self.cas_refs:
-            return None
-        bundles = self.get_bundles_for_ref(remote_ref)
-        if len(bundles) > 1:
-            # A ref carrying several bundles is broken; remove_remote_ref reports that on its own
-            # terms, and a lease verdict here would only mask it.
-            return None
-        remote_sha = bundles[0]["Key"].split("/")[-1].split(".")[0] if bundles else None
-        return self.lease_violation_error(remote_ref=remote_ref, remote_sha=remote_sha)
-
     def non_fast_forward_error(
-        self, *, remote_ref: str, local_ref: str, remote_sha: str, force_push: bool
+        self, *, remote_ref: str, local_ref: str, remote_sha: str, force_push: bool, protected: bool
     ) -> str | None:
         """Authorises replacing a remote sha that is not an ancestor of what is being pushed.
 
-        Callers must only reach here for a genuinely non-fast-forward update, since the protection
-        check costs an S3 round trip.
+        Callers must only reach here for a genuinely non-fast-forward update.
 
         Returns:
             str | None: the error line to send back to git, or None when the update may proceed
@@ -799,75 +757,10 @@ class S3Remote:
                 )
 
         # A lease-approved update replaces history just as a `+` push does, so both answer to the
-        # protected marker.
-        if self.is_protected(remote_ref):
+        # manifest's protected list.
+        if protected:
             return f'error {remote_ref} "remote ref is protected."?\n'
         return None
-
-    def acquire_lock(self, remote_ref: str) -> str | None:
-        """Acquire a per-ref lock using S3 conditional writes.
-
-        Client attempts to create a single lock object under <prefix>/<ref>/ using
-        S3's HTTP `If-None-Match` conditional header so that only one client can write the
-        lock in case of acquisition races.
-        If unable to acquire the lock, check for staleness of the lock and delete it if it is stale.
-        Clients that lose the race will get a `412 PreconditionFailed` and should retry later.
-
-        Returns the lock key if acquired, or None otherwise.
-        """
-
-        lock_key = f"{self.prefix}/{remote_ref}/LOCK#.lock"
-        try:
-            # Use conditional write to create the lock only if it does not exist
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=lock_key,
-                Body=b"",
-                IfNoneMatch="*",
-            )
-            return lock_key
-        except botocore.exceptions.ClientError as e:
-            # 412 PreconditionFailed when the lock already exists
-            if e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 412 or e.response.get("Error", {}).get(
-                "Code"
-            ) in [
-                "PreconditionFailed",
-                "412",
-            ]:
-                # Check if the existing lock is stale; if so, try to clear and acquire
-                try:
-                    head = self.s3.head_object(Bucket=self.bucket, Key=lock_key)
-                    last_modified = head.get("LastModified")
-                    if last_modified is not None:
-                        import datetime
-
-                        now = datetime.datetime.now(tz=last_modified.tzinfo)
-                        age = (now - last_modified).total_seconds()
-                        if age > self.lock_ttl_seconds:
-                            # Attempt to delete stale lock and re-acquire
-                            self.s3.delete_object(Bucket=self.bucket, Key=lock_key)
-                            # Retry conditional put
-                            self.s3.put_object(
-                                Bucket=self.bucket,
-                                Key=lock_key,
-                                Body=b"",
-                                IfNoneMatch="*",
-                            )
-                            return lock_key
-                except botocore.exceptions.ClientError as e:
-                    logger.info(f"failed to check staleness of {lock_key} for {remote_ref}: {e}")
-                    raise e
-            raise
-
-    def release_lock(self, remote_ref: str, lock_key: str) -> None:
-        """Release a previously acquired lock for the given ref."""
-        try:
-            self.s3.delete_object(Bucket=self.bucket, Key=lock_key)
-        except botocore.exceptions.ClientError as e:
-            if e.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
-                logger.info(f"lock {lock_key} already released")
-            else:
-                raise
 
     def cmd_option(self, arg: str):
         parts = arg.strip().split(" ")
@@ -1010,14 +903,12 @@ class S3Remote:
             logger.info("empty line")
             if self.mode == Mode.PUSH and self.push_cmds:
                 logger.info(f"pushing {self.push_cmds}")
-                push_res = [self.cmd_push(c) for c in self.push_cmds]
-                for res in push_res:
+                for res in self.process_push_cmds(self.push_cmds):
                     sys.stdout.write(res)
                 self.push_cmds = []
                 # git sends one batch per invocation today, but the protocol permits several; a
-                # stale lease or protection verdict must not leak into a later batch.
+                # stale lease must not leak into a later batch.
                 self.cas_refs = {}
-                self._protected_cache = {}
             elif self.mode == Mode.FETCH and self.fetch_cmds:
                 logger.info(f"fetching {len(self.fetch_cmds)} refs in parallel")
                 self.process_fetch_cmds(self.fetch_cmds)
