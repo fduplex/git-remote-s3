@@ -318,7 +318,7 @@ def _doctor_with_probe(probe, prefix="prefix"):
             return_value=probe,
         ),
     ):
-        doctor = Doctor(None, "bucket", prefix, False)
+        doctor = Doctor(None, "bucket", prefix)
         doctor.check_access_grants()
 
 

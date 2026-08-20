@@ -12,7 +12,7 @@ Apache License 2.0 (unchanged). Notable additions in this fork:
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
 - S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
 - Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
-- Pushing from a shallow clone is rejected with a clear error telling you to run `git fetch --unshallow` first, instead of silently uploading a truncated bundle
+- Pushing from a shallow clone is rejected with a clear error telling you to run `git fetch --unshallow` first, instead of silently uploading a truncated pack
 - Partial clones (`git clone --filter=blob:none` / `--filter=tree:0`) are fully supported for push and fetch
 - Push and fetch render live transfer progress on the terminal, honoring `git push --quiet` / `--progress`
 - `--force-with-lease` is supported with real compare-and-swap semantics against the remote ref, not just a `+` force push
@@ -44,16 +44,13 @@ It also provide an implementation of the [git-lfs custom transfer](https://githu
   - [S3 Access Grants](#s3-access-grants)
   - [Branches, etc.](#branches-etc)
   - [Using S3 remotes for submodules](#using-s3-remotes-for-submodules)
-- [Repo as S3 Source for AWS CodePipeline](#repo-as-s3-source-for-aws-codepipeline)
-  - [Archive file location](#archive-file-location)
-  - [Example AWS CodePipeline source action config](#example-aws-codepipeline-source-action-config)
 - [LFS](#lfs)
   - [Fetching through a facade URL (uv and friends)](#fetching-through-a-facade-url-uv-and-friends)
   - [Creating the repo and pushing](#creating-the-repo-and-pushing)
   - [Clone the repo](#clone-the-repo)
 - [Notes about specific behaviors of Amazon S3 remotes](#notes-about-specific-behaviors-of-amazon-s3-remotes)
   - [Arbitrary Amazon S3 URIs](#arbitrary-amazon-s3-uris)
-  - [Concurrent writes](#concurrent-writes)
+  - [Concurrency and locking](#concurrency-and-locking)
 - [Manage the Amazon S3 remote](#manage-the-amazon-s3-remote)
   - [Delete branches](#delete-branches)
   - [Protected branches](#protected-branches)
@@ -187,15 +184,9 @@ git commit -a -m "hello"
 git push --set-upstream origin main
 ```
 
-The remote HEAD is set to track the branch that has been pushed first to the remote repo. To change the remote HEAD branch, delete the HEAD object `s3://<bucket>/<prefix>/HEAD` and then run `git-remote-s3 doctor s3://<bucket>/<prefix>`.
+The remote HEAD is set to track the branch that has been pushed first to the remote repo. To change the remote HEAD branch, run `git-s3 head s3://<bucket>/<prefix> <branch>`.
 
-When you use `s3+zip://` instead of `s3://`, an additional zip archive named `repo.zip` is uploaded next to the `sha.bundle` file. This is for example useful if you want to use the Repo as a S3 Source for AWS CodePipeline, which expects a `.zip` file. The path on S3 when you push to the `main` branch is for example `refs/heads/main/repo.zip`. See [How S3 remote work](#how-s3-remote-work) for more details about the bundle file.
-
-The `s3+zip://` transport is still fully supported. However, because PyPI does not permit the `+` character in an
-installed command name, the `git-remote-s3+zip` helper is no longer installed automatically. If you use `s3+zip://`
-remotes, create the helper once as an alias of the `s3` helper, e.g.
-`ln -s "$(command -v git-remote-s3)" ~/.local/bin/git-remote-s3+zip` (or copy it to a directory on your `PATH` on
-Windows).
+`s3+zip://` is accepted for back-compat but is deprecated and now behaves exactly like `s3://`: no `repo.zip` archive is written. Use `s3://` for new remotes.
 
 ### Clone a repo
 
@@ -334,32 +325,6 @@ Or, to enable globally:
 git config --global protocol.s3.allow always
 ```
 
-## Repo as S3 Source for AWS CodePipeline
-
-[AWS CodePipeline](https://aws.amazon.com/codepipeline/) offers an [Amazon S3 source action](https://docs.aws.amazon.com/codepipeline/latest/userguide/integrations-action-type.html#integrations-source-s3)
-as location for your source code and application files. But this requires to `upload the source files as a single ZIP file`.
-As briefly mentioned in [Create a new repo](#create-a-new-repo), `git-remote-s3` can create and upload zip archives.
-When you use `s3+zip` as URI Scheme when you add the remote, `git-remote-s3` will automatically upload an archive that can be used by AWS CodePipeline.
-
-### Archive file location
-
-Let's assume your bucket name is `my-git-bucket` and the repo is called `my-repo`. Run `git remote add origin s3+zip://my-git-bucket/my-repo` to use it as remote.
-When you now commit your changes and push to the remote, an additional `repo.zip` file will be uploaded to the bucket.
-For example, if you push to the `main` branch (`git push origin main`), the file is available under `s3://my-git-bucket/my-repo/refs/heads/main/repo.zip`.
-When you push to a branch called `fix_a_bug` it's available under `s3://my-git-bucket/my-repo/refs/heads/fix_a_bug/repo.zip`.
-And if you create and push a tag called `v1.0` it will be `s3://my-git-bucket/my-repo/refs/tags/v1.0/repo.zip`.
-
-### Example AWS CodePipeline source action config
-
-Your AWS CodePipeline Action configuration to trigger when you update your `main` branch:
-
-- Action Provider: `Amazon S3`
-- Bucket: `my-git-bucket`
-- S3 object key: `my-repo/refs/heads/main/repo.zip`
-- Change detection options: `AWS CodePipeline`
-
-Visit [Tutorial: Create a simple pipeline (S3 bucket)](https://docs.aws.amazon.com/codepipeline/latest/userguide/tutorials-simple-s3.html) to learn more about a S3 bucket as source action.
-
 ## LFS
 
 To use LFS you need to first install git-lfs. You can refer to the [official documentation](https://git-lfs.com/) on how to do this on your system.
@@ -464,79 +429,19 @@ origin  s3://my-git-bucket/this-is-a-new-repo (push)
 
 **Tip**: This behavior can be used to quickly create a new git repo.
 
-`git-remote-s3` implements **per-reference locking** to prevent concurrent write conflicts when multiple clients push to the same branch simultaneously.
+### Concurrency and locking
 
+`git-remote-s3` has no locks. Every ref in the repo — branch, tag, and HEAD — lives in a single object, `<prefix>/gitwal.json`, and every write to that repo is one conditional PUT against it: `If-None-Match: *` to create it, `If-Match: <etag>` to update it. S3 only accepts the PUT if the etag still matches what the client read, so two pushers racing each other cannot both win. The loser's PUT is rejected with a precondition failure, and `git-remote-s3` reloads the manifest, re-checks the push against the refs it now names (fast-forward, `--force`, `--force-with-lease`, protected-branch), and retries the whole decision from scratch. There is nothing to time out, nothing to expire, and nothing to clean up by hand.
 
-When pushing to a remote reference, `git-remote-s3` uses S3 conditional writes to acquire an exclusive lock for that specific reference:
+The objects a push uploads — packs under `<prefix>/packs/<sha>.pack`, LFS blobs under `<prefix>/lfs/<oid>` — are content-addressed and written before the manifest CAS, so they are immutable and safe to upload from multiple clients at once; the manifest PUT is the single serialization point that decides which pack(s) actually become part of a ref's history. A pack uploaded by a push that loses the race is simply never referenced by any entry and becomes an orphan, reclaimed the next time someone runs `git-s3 compact`. No data is lost and no ref is ever left pointing at more than one place.
 
-1. **Lock acquisition**: A lock file is created at `<prefix>/<ref>/LOCK#.lock` using S3's `IfNoneMatch="*"` condition, ensuring only one client can acquire the lock at a time
-2. **Push execution**: While holding the lock, the client safely uploads the new bundle and cleans up the previous one
-3. **Lock release**: The lock is automatically released after the push completes
-
-#### Concurrent push behavior
-
-If multiple clients attempt to push to the same reference simultaneously:
-
-- Only one client will successfully acquire the lock and proceed with the push
-- Other clients will receive a clear error message indicating lock acquisition failed
-- The failed clients can retry their push after the lock is released
-
-Example error message when lock acquisition fails:
-
-```
-error refs/heads/main "failed to acquire ref lock at my-repo/refs/heads/main/LOCK#.lock. 
-Another client may be pushing. If this persists beyond 60s, 
-run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
-```
-
-#### Lock timeout and cleanup
-
-- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable)
-- **Stale lock detection**: If a lock becomes stale (older than the TTL), it can be automatically replaced during lock acquisition
-- **Manual cleanup**: Use `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally clean up stale locks
-
-This locking mechanism eliminates the race conditions that could previously result in multiple bundles per reference, ensuring consistent repository state across concurrent operations.
-
-
-### Concurrent writes
-
-Due to the distributed nature of `git`, there might be cases (albeit rare) where 2 or more `git push` are executed at the same time by different user with their own modification of the same branch. `git-remote-s3` implements **per-reference locking** to prevent concurrent write conflicts in those cases.
-
-#### Per-reference locking
-The git command executes the push in 4 steps:
-
-1. first it checks if the remote reference is the correct ancestor for the commit being pushed
-2. if that is correct it invokes the `git-remote-s3` command then attempts acquire a lock by creating the lock object `<prefix>/<ref>/LOCK#.lock` using S3 conditional writes.
-3. while holding the lock, `git-remote-s3` safely writes the bundle to the S3 bucket at the `refs/heads/<branch>` path
-4. `git-remote-s3` deletes the lock object after the push succeeds, thereby releasing the lock for that ref
-
-Clients that fail to acquire the lock will fail with the following error and can try to push again.
-
-```
-error refs/heads/main "failed to acquire ref lock at my-repo/refs/heads/main/LOCK#.lock. 
-Another client may be pushing. If this persists beyond 60s, 
-run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
-```
-
-The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable
-If for some reason a reference's lock becomes stale, `git-remote-s3` automatically clears it when executing a git push.
-If you repeatedly run into lock acquisition failures or otherwise want to manually clean up stale locks, run `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally remove those stale locks.
-
-#### Multiple branch heads
-In the (rare) case where multiple `git push` commands are simultaneously executed with one or more clients running an outdated version of `git-remote-s3` without locking proection, then it is possible that that multiple bundles will be written to S3 for the same branch head. All subsequent `git push` commands will fail with the following error:
-
-```
-error: dst refspec refs/heads/<branch>> matches more than one
-error: failed to push some refs to 's3://<bucket>/<prefix>'
-```
-
-To fix this issue, run the `git-remote-s3 doctor <s3-uri>` command. By default it will create a new branch for every bundle that should not be retained. The user can then checkout the branch locally and merge it to the original branch. If you want instead to remove the bundle, specify `--delete-bundle`.
+`git-s3 doctor <s3-uri>` audits a repo's manifest and packs (schema validation, missing packs, orphan packs, whether compaction is due) without writing anything.
 
 ## Manage the Amazon S3 remote
 
 ### Delete branches
 
-To remove remote branches that are not used anymore you can use the `git-s3 delete-branch <s3uri> -b <branch_name>` command. This command deletes the bundle object(s) from Amazon S3 under the branch path.
+To remove remote branches that are not used anymore you can use the `git-s3 delete-branch <s3uri> <branch_name>` command. This is a refs-only change: a conditional PUT drops the branch from the manifest. The packs it uniquely referenced stay in the bucket until `git-s3 compact` reclaims them.
 
 ### Protected branches
 
@@ -546,16 +451,13 @@ To protect/unprotect a branch run `git s3 protect <remote> <branch-name>` respec
 
 ### How S3 remote work
 
-Bundles are stored in the S3 bucket as `<prefix>/<ref>/<sha>.bundle`.
+A repo is one manifest object, `<prefix>/gitwal.json`, plus the packs it names under `<prefix>/packs/<sha>.pack`. The manifest is the sole authority for what a ref points to: it lists every branch and tag, the HEAD, the protected refs, and a log of entries, each naming a pack and the tips that pack makes reachable.
 
-When listing remote ref (eg explicitly via `git ls-remote`) we list all the keys present under the given `<prefix>`.
+Listing refs (`git ls-remote`, the start of a clone or fetch) reads the manifest, no bucket listing required.
 
-When pushing a new ref (eg a commit), we get the sha of the ref, we bundle the ref via `git bundle create <sha>.bundle <ref>` and store it to S3 according the schema above.
+Pushing packs the new objects with `git pack-objects`, excluding whatever the manifest already has, uploads the pack to its content-addressed key, then commits with a single conditional PUT to `gitwal.json` (see [Concurrency and locking](#concurrency-and-locking)). The PUT is the only step that can fail on a race; the pack upload before it is inert until an entry in the manifest names it.
 
-If the push is successful, the code removes the previous bundle associated to the ref.
-
-If two user concurrently push a commit based on the same current branch head to the remote both bundles would be written to the repo and the current bundle removed. No data is lost, but no further push will be possible until all bundles but one are removed.
-For this you can use the `git s3 doctor <remote>` command.
+Because entries accumulate with every push, the log slowly grows one pack per push and the same objects can end up duplicated across several packs. `git-s3 compact <remote>` collapses the whole log into a single base pack covering every current ref, then deletes the packs it superseded.
 
 ### How LFS work
 

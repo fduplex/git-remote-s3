@@ -6,7 +6,6 @@ import os
 import re
 import struct
 import subprocess
-import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -96,8 +95,8 @@ def _pack(*, folder: str, revs: list[str], subject: str, progress: bool, quiet: 
         args.append("--progress")
 
     incoming = f"{folder}/incoming.pack"
-    # As in bundle(): git's progress meter only reaches the user when stderr is inherited, so the
-    # captured text is only available when progress is off. The pack itself is on stdout.
+    # git's progress meter only reaches the user when stderr is inherited, so the captured text
+    # is only available when progress is off. The pack itself is on stdout.
     with open(incoming, "wb") as out:
         result = subprocess.run(
             args,
@@ -193,88 +192,6 @@ def has_complete_history(sha: str) -> bool:
     return result.returncode == 0
 
 
-def archive(*, folder: str, ref: str) -> str:
-    """Archive the content of the folder into a repo.zip file
-
-    Args:
-        folder (str): the folder to archive
-        ref (str): the ref to archive
-
-    Returns:
-        str: the path to the archive file
-    """
-
-    file_path = f"{folder}/repo.zip"
-    result = subprocess.run(
-        ["git", "archive", "--format", "zip", "--output", file_path, ref],
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to archive {ref}")
-    return file_path
-
-
-def bundle(*, folder: str, sha: str, ref: str, progress: bool = False, quiet: bool = False) -> str:
-    """Bundles the content of the folder into a sha.bundle file
-
-    Args:
-        folder (str): the folder to bundle
-        sha (str): the sha of the bundle. A bundle is stored as sha.bundle
-        ref (str): the ref to bundle
-        progress (bool): let git render its own progress meter on the inherited stderr
-        quiet (bool): suppress git's output entirely
-
-    Returns:
-        str: the path to the bundle file
-    """
-    file_path = f"{folder}/{sha}.bundle"
-    args = ["git", "bundle", "create"]
-    if quiet:
-        args.append("-q")
-    elif progress:
-        args.append("--progress")
-    args += [file_path, ref]
-
-    # git's progress meter only reaches the user when stderr is inherited, so it cannot be
-    # captured in that mode; the captured text below is therefore only available when progress
-    # is off.
-    result = subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=None if (progress and not quiet) else subprocess.PIPE,
-    )
-
-    if result.returncode != 0:
-        raise GitError(result.stderr.decode("utf8") if result.stderr else f"failed to bundle {ref}")
-    return file_path
-
-
-def unbundle(*, folder: str, sha: str, ref: str, progress: bool = False):
-    """Unbundles the content of the bundle referred by the sha
-
-    Args:
-        folder (str): the folder where the bundle is located
-        sha (str): the sha of the bundle. A bundle is stored as sha.bundle
-        ref (str): the ref to checkout after unbundling
-        progress (bool): let git render its own progress meter on stderr
-
-    Raises:
-        GitError: if git could not apply the bundle
-    """
-    args = ["git", "bundle", "unbundle"]
-    if progress:
-        args.append("--progress")
-    args += [f"{folder}/{sha}.bundle", ref]
-    result = subprocess.run(
-        args,
-        stdout=sys.stderr,
-    )
-
-    if result.returncode != 0:
-        raise GitError(f"failed to unbundle {sha} into {ref}")
-
-
 def rev_parse(ref: str) -> str:
     """Gets the sha of a ref
 
@@ -345,11 +262,3 @@ def validate_ref_name(name: str) -> bool:
         )
         is None
     )
-
-
-def get_last_commit_message() -> str:
-    result = subprocess.run(["git", "log", "-1", "--pretty=%h %s"], stdout=subprocess.PIPE)
-    if result.returncode != 0:
-        raise GitError("fatal: an error as occurred")
-    message = result.stdout.decode("utf8").strip()
-    return message

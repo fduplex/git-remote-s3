@@ -24,7 +24,7 @@ _MB = 1024**2
 
 # 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
 # 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling. Shared by
-# the bundle transfers in remote.py and the LFS object transfers in lfs.py.
+# the pack transfers in remote.py and the LFS object transfers in lfs.py.
 TRANSFER_CONFIG = TransferConfig(
     multipart_threshold=25 * _MB,
     multipart_chunksize=16 * _MB,
@@ -405,7 +405,7 @@ def register_s3_access_grants_readwrite(s3_client, session):
     rather than a WRITE one, which is what an ``If-Match`` / ``If-None-Match`` PUT needs: S3
     evaluates s3:GetObject on a conditional write, and a WRITE session policy does not allow it.
 
-    Reserved for the manifest CAS client. Everything else (bundle and LFS uploads) issues plain
+    Reserved for the manifest CAS client. Everything else (pack and LFS uploads) issues plain
     PUTs and keeps the tighter WRITE session.
 
     Args:

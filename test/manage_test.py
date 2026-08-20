@@ -43,7 +43,7 @@ def test_doctor_without_branch_parses_and_runs(mocked_cli_chain, monkeypatch):
         main()
 
     assert excinfo.value.code == 0
-    doctor_cls.assert_called_once_with("profile", "bucket", "repo", False)
+    doctor_cls.assert_called_once_with("profile", "bucket", "repo")
     doctor_cls.return_value.run.assert_called_once_with()
     manage_branch_cls.assert_not_called()
 
@@ -57,20 +57,6 @@ def test_doctor_exit_code_is_the_audit_verdict(mocked_cli_chain, monkeypatch):
         main()
 
     assert excinfo.value.code == 1
-
-
-def test_doctor_takes_the_legacy_sweep_flag(mocked_cli_chain, monkeypatch):
-    doctor_cls, _, _ = mocked_cli_chain
-    monkeypatch.setattr(
-        "sys.argv",
-        ["git-s3", "doctor", "--delete-legacy", "s3://profile@bucket/repo"],
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        main()
-
-    assert excinfo.value.code == 0
-    doctor_cls.assert_called_once_with("profile", "bucket", "repo", True)
 
 
 def test_compact_is_wired_to_the_remote(mocked_cli_chain, monkeypatch):
@@ -140,7 +126,7 @@ def _listing(sizes):
     return side_effect
 
 
-def _doctor(manifest, sizes=None, *, prefix=NESTED_PREFIX, delete_legacy=False):
+def _doctor(manifest, sizes=None, *, prefix=NESTED_PREFIX):
     """A Doctor over a stubbed client holding real manifest bytes and a scripted listing."""
     client = MagicMock()
     with (
@@ -151,7 +137,7 @@ def _doctor(manifest, sizes=None, *, prefix=NESTED_PREFIX, delete_legacy=False):
     ):
         store = ManifestStore(client, manifest=manifest, key=f"{prefix}/gitwal.json")
         client.list_objects_v2.side_effect = _listing(sizes or {})
-        return Doctor(None, "bucket", prefix, delete_legacy), store
+        return Doctor(None, "bucket", prefix), store
 
 
 def _run_doctor(doctor):
@@ -273,58 +259,13 @@ def test_doctor_advises_compaction_when_the_log_has_grown(capsys):
 
 
 def test_doctor_reports_a_repo_with_no_manifest(capsys):
-    doctor, _ = _doctor(None, {f"{NESTED_PREFIX}/refs/heads/main/{SHA1}.bundle": 100})
+    doctor, _ = _doctor(None, {})
 
     code = _run_doctor(doctor)
 
     out = capsys.readouterr().out
     assert code == 0
     assert "gitwal.json: missing (this repo has not been migrated)" in out
-
-
-def _legacy_sizes():
-    manifest, sizes = _healthy()
-    sizes.update(
-        {
-            f"{NESTED_PREFIX}/HEAD": 16,
-            f"{NESTED_PREFIX}/refs/heads/main/{SHA1}.bundle": 2048,
-            f"{NESTED_PREFIX}/refs/heads/main/LOCK#.lock": 0,
-            f"{NESTED_PREFIX}/refs/heads/feature/PROTECTED#": 0,
-            f"{NESTED_PREFIX}/repo.zip": 1024,
-        }
-    )
-    return manifest, sizes
-
-
-def test_doctor_reports_pre_migration_keys_without_deleting_them(capsys):
-    doctor, store = _doctor(*_legacy_sizes())
-
-    code = _run_doctor(doctor)
-
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "5 legacy objects (3.0 KiB)" in out
-    assert f"{NESTED_PREFIX}/refs/heads/main/LOCK#.lock" in out
-    assert "run with --delete-legacy to remove them" in out
-    store.client.delete_object.assert_not_called()
-
-
-def test_doctor_deletes_pre_migration_keys_under_the_flag():
-    manifest, sizes = _legacy_sizes()
-    doctor, store = _doctor(manifest, sizes, delete_legacy=True)
-
-    assert _run_doctor(doctor) == 0
-
-    deleted = {call.kwargs["Key"] for call in store.client.delete_object.call_args_list}
-    assert deleted == {
-        f"{NESTED_PREFIX}/HEAD",
-        f"{NESTED_PREFIX}/refs/heads/main/{SHA1}.bundle",
-        f"{NESTED_PREFIX}/refs/heads/main/LOCK#.lock",
-        f"{NESTED_PREFIX}/refs/heads/feature/PROTECTED#",
-        f"{NESTED_PREFIX}/repo.zip",
-    }
-    # The manifest, the live pack and the LFS store are not legacy.
-    assert not any(k.endswith(("gitwal.json", ".pack")) or "/lfs/" in k for k in deleted)
 
 
 PREFIX = "repo"

@@ -68,8 +68,8 @@ def _now() -> str:
 def _is_legacy_key(rel: str) -> bool:
     """Whether a repo-relative key belongs to the pre-manifest format.
 
-    Deliberately narrow: lfs/<oid>, packs/*.pack and gitwal.json must never match. This whole
-    arm is deleted one release after the last repo is migrated.
+    Used by ``migrate --finalize`` to find what to delete once a repo has moved to the WAL
+    format. Deliberately narrow: lfs/<oid>, packs/*.pack and gitwal.json must never match.
     """
     leaf = rel.rpartition("/")[2]
     return rel == "HEAD" or leaf in ("PROTECTED#", "repo.zip") or rel.endswith((".lock", ".bundle"))
@@ -179,10 +179,6 @@ class Doctor(_Repo):
     it treats as corruption is an entry naming a pack that is not there.
     """
 
-    def __init__(self, profile, bucket, prefix, delete_legacy=False) -> None:
-        super().__init__(profile, bucket, prefix)
-        self.delete_legacy = delete_legacy
-
     def run(self) -> int:
         """Prints the report and returns the process exit code."""
         self.check_access_grants()
@@ -194,7 +190,6 @@ class Doctor(_Repo):
         else:
             errors += self.report_manifest(manifest)
             errors += self.report_packs(manifest)
-        self.report_legacy()
         return 1 if errors else 0
 
     def load_manifest(self) -> gitwal.Manifest | None:
@@ -289,38 +284,6 @@ class Doctor(_Repo):
 
     def list_repo_objects(self) -> list[dict]:
         return self.list_objects()
-
-    def report_legacy(self) -> None:
-        """Reports (and with --delete-legacy, removes) the pre-migration keys.
-
-        Bundles, PROTECTED# markers, residual LOCK#.lock files, repo.zip and the <repo>/HEAD
-        object are invisible to every reader of the new format, so this is housekeeping rather
-        than a correctness matter. The whole arm goes away one release after the last migration.
-        """
-        print("\nScanning for pre-migration keys...")
-        base = scoped_list_prefix(self.prefix)
-        legacy = [
-            (o["Key"], o.get("Size", 0)) for o in self.list_objects() if _is_legacy_key(o["Key"].removeprefix(base))
-        ]
-        if not legacy:
-            print(" none found")
-            return
-
-        total = sum(size for _key, size in legacy)
-        print(f" {len(legacy)} legacy objects ({_human_bytes(total)})")
-        for key, _size in legacy:
-            print(f"  - {key}")
-        if not self.delete_legacy:
-            print(" run with --delete-legacy to remove them")
-            return
-
-        print(" Deleting...")
-        for key, _size in legacy:
-            try:
-                self.s3.delete_object(Bucket=self.bucket, Key=key)
-                print(f"  deleted {key}")
-            except ClientError as x:
-                print(f"  failed to delete {key}: {x}")
 
 
 class Compact(_Repo):
@@ -720,11 +683,6 @@ def main():  # noqa: C901
     parser.add_argument("command")
     parser.add_argument("remote", help="The remote s3 uri to analyze, including the AWS profile if used")
     parser.add_argument(
-        "--delete-legacy",
-        action="store_true",
-        help="Delete the pre-migration keys doctor reports (bundles, PROTECTED#, locks, repo.zip, HEAD)",
-    )
-    parser.add_argument(
         "--finalize",
         action="store_true",
         help="migrate: delete the pre-migration keys, after the repo has been observed",
@@ -762,7 +720,7 @@ def main():  # noqa: C901
         sys.exit(1)
     try:
         if args.command == "doctor":
-            sys.exit(Doctor(profile, bucket, prefix, args.delete_legacy).run())
+            sys.exit(Doctor(profile, bucket, prefix).run())
         if args.command == "compact":
             sys.exit(Compact(profile, bucket, prefix).run())
         if args.command == "migrate":

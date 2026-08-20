@@ -185,48 +185,6 @@ def test_cmd_option_unknown_is_unsupported(session_client_mock, stdout_mock):
     assert stdout_mock.getvalue() == "unsupported\nunsupported\n"
 
 
-@patch("git_remote_s3.git.subprocess.run")
-def test_bundle_default_captures_stderr(run_mock):
-    run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
-    git.bundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}")
-
-    cmd = run_mock.call_args[0][0]
-    assert cmd == ["git", "bundle", "create", f"/tmp/folder/{SHA1}.bundle", f"refs/heads/{BRANCH}"]
-    assert run_mock.call_args.kwargs["stderr"] == subprocess.PIPE
-
-
-@patch("git_remote_s3.git.subprocess.run")
-def test_bundle_progress_inherits_stderr(run_mock):
-    run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=None)
-    git.bundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}", progress=True)
-
-    cmd = run_mock.call_args[0][0]
-    assert cmd[:4] == ["git", "bundle", "create", "--progress"]
-    assert run_mock.call_args.kwargs["stderr"] is None
-
-
-@patch("git_remote_s3.git.subprocess.run")
-def test_bundle_quiet_wins_over_progress(run_mock):
-    run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
-    git.bundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}", progress=True, quiet=True)
-
-    cmd = run_mock.call_args[0][0]
-    assert "-q" in cmd
-    assert "--progress" not in cmd
-    assert run_mock.call_args.kwargs["stderr"] == subprocess.PIPE
-
-
-@patch("git_remote_s3.git.subprocess.run")
-def test_unbundle_progress_flag(run_mock):
-    run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0)
-    git.unbundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}", progress=True)
-    assert run_mock.call_args[0][0][:4] == ["git", "bundle", "unbundle", "--progress"]
-
-    run_mock.reset_mock()
-    git.unbundle(folder="/tmp/folder", sha=SHA1, ref=f"refs/heads/{BRANCH}")
-    assert "--progress" not in run_mock.call_args[0][0]
-
-
 @patch("sys.stdout", new_callable=StringIO)
 @patch("boto3.Session.client")
 def test_cmd_option_cas_records_lease(session_client_mock, stdout_mock):
@@ -284,34 +242,10 @@ def test_is_shallow_repository_distinguishes_shallow_from_partial(tmp_path, monk
     assert git.is_shallow_repository() is True
 
     # Partial clones are not blocked: pack-objects faults the missing objects back in from the
-    # promisor remote while bundling, so the bundle stays complete (asserted below).
+    # promisor remote, so the pack it writes stays complete.
     blobless = _clone(origin, tmp_path / "blobless", "--filter=blob:none")
     monkeypatch.chdir(blobless)
     assert git.is_shallow_repository() is False
-
-
-def test_bundle_from_blobless_clone_is_complete(tmp_path, monkeypatch):
-    origin = _make_origin(tmp_path)
-    blobless = _clone(origin, tmp_path / "blobless", "--filter=blob:none")
-    (blobless / "file.txt").write_text("revision-4\n")
-    _git("commit", "-qam", "r4", cwd=blobless)
-
-    monkeypatch.chdir(blobless)
-    sha = git.rev_parse("refs/heads/main")
-    bundle_path = git.bundle(folder=str(tmp_path), sha=sha, ref="refs/heads/main", quiet=True)
-
-    restored = tmp_path / "restored.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(restored)], check=True, stdout=subprocess.DEVNULL)
-    _git("fetch", "-q", bundle_path, "refs/heads/*:refs/heads/*", cwd=restored)
-
-    fsck = subprocess.run(["git", "fsck", "--full"], cwd=restored, capture_output=True, text=True)
-    assert fsck.returncode == 0, fsck.stderr
-    assert "missing" not in fsck.stderr
-    # Every object of the full history, including blobs the partial clone never held, made it over.
-    objects = subprocess.run(
-        ["git", "rev-list", "--objects", "--all"], cwd=restored, capture_output=True, text=True, check=True
-    )
-    assert objects.stdout.count("\n") == 5 * 3
 
 
 @patch("sys.stderr", new_callable=StringIO)
