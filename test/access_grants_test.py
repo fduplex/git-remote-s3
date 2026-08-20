@@ -6,11 +6,16 @@ from unittest.mock import MagicMock, patch
 
 from git_remote_s3 import S3Remote, UriScheme
 from git_remote_s3 import common
+from aws_s3_access_grants_boto3_plugin.cache.cache_key import CacheKey
+from botocore.credentials import Credentials
+
 from git_remote_s3.common import (
     register_s3_access_grants,
+    register_s3_access_grants_readwrite,
     resolve_bucket_region,
     s3_region_kwargs,
     scoped_list_prefix,
+    _ConditionalWritePlugin,
     _detect_access_grants_fallback,
 )
 from git_remote_s3.manage import Doctor
@@ -89,6 +94,94 @@ def test_s3remote_registers_plugin_on_its_client(session_cls, plugin_cls):
 
     plugin_cls.assert_called_once_with(client, fallback_enabled=True, customer_session=session._session)
     client.meta.events.register.assert_called_once_with("before-sign.s3", _detect_access_grants_fallback)
+
+
+def _conditional_write_plugin():
+    """A plugin instance with its caches stubbed; __init__ would build real STS/S3 clients."""
+    plugin = object.__new__(_ConditionalWritePlugin)
+    plugin.access_denied_cache = MagicMock()
+    plugin.access_denied_cache.get_value_from_cache.return_value = None
+    plugin.access_grants_cache = MagicMock()
+    plugin.access_grants_cache.get_credentials.return_value = {"AccessKeyId": "vended"}
+    return plugin
+
+
+def _cache_key(permission):
+    return CacheKey(
+        credentials=Credentials("ak", "sk"),
+        permission=permission,
+        s3_prefix="s3://bucket/core/cli/gitwal.json",
+    )
+
+
+def _requested_permission(plugin):
+    return plugin.access_grants_cache.get_credentials.call_args[0][1].permission
+
+
+@pytest.mark.parametrize(
+    ("mapped", "requested"),
+    [("WRITE", "READWRITE"), ("READ", "READ"), ("READWRITE", "READWRITE")],
+)
+def test_conditional_write_plugin_upgrades_only_write(mapped, requested):
+    # A conditional PutObject is evaluated against s3:GetObject too, and the plugin maps
+    # put_object to WRITE, whose vended session policy has no GetObject.
+    plugin = _conditional_write_plugin()
+
+    assert plugin._get_value_from_cache(_cache_key(mapped), MagicMock(), "123456789012") == {"AccessKeyId": "vended"}
+
+    assert _requested_permission(plugin) == requested
+
+
+def test_conditional_write_plugin_keeps_the_prefix_and_credentials():
+    plugin = _conditional_write_plugin()
+
+    plugin._get_value_from_cache(_cache_key("WRITE"), MagicMock(), "123456789012")
+
+    key = plugin.access_grants_cache.get_credentials.call_args[0][1]
+    assert key.s3_prefix == "s3://bucket/core/cli/gitwal.json"
+    assert key.credentials.access_key == "ak"
+
+
+@patch("git_remote_s3.common._ConditionalWritePlugin")
+def test_register_readwrite_registers_the_upgrading_plugin(plugin_cls):
+    client = MagicMock()
+    session = MagicMock()
+
+    returned = register_s3_access_grants_readwrite(client, session)
+
+    assert returned is client
+    plugin_cls.assert_called_once_with(client, fallback_enabled=True, customer_session=session._session)
+    plugin_cls.return_value.register.assert_called_once_with()
+    client.meta.events.register.assert_called_once_with("before-sign.s3", _detect_access_grants_fallback)
+
+
+@patch("git_remote_s3.remote.register_s3_access_grants_readwrite")
+@patch("git_remote_s3.common.S3AccessGrantsPlugin")
+@patch("boto3.Session")
+def test_s3remote_manifest_writes_use_a_readwrite_client(session_cls, _plugin_cls, register_readwrite):
+    session_cls.return_value.client.return_value.head_bucket.return_value = {"BucketRegion": "us-west-2"}
+    wal = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").wal
+
+    # Reads stay on the per-operation client; only the conditional PUTs pay for a second one.
+    assert wal.s3 is not register_readwrite.return_value
+    register_readwrite.assert_not_called()
+
+    assert wal.write_s3 is register_readwrite.return_value
+    register_readwrite.assert_called_once()
+
+
+@patch("git_remote_s3.manage.register_s3_access_grants_readwrite")
+@patch("git_remote_s3.manage.register_s3_access_grants")
+@patch("git_remote_s3.manage.s3_region_kwargs", return_value={})
+@patch("boto3.Session")
+def test_manage_repo_manifest_writes_use_a_readwrite_client(session_cls, _kwargs, _register, register_readwrite):
+    from git_remote_s3.manage import _Repo
+
+    repo = _Repo(None, "bucket", "prefix")
+
+    assert repo.wal.write_s3 is register_readwrite.return_value
+    assert repo.wal.s3 is not register_readwrite.return_value
+    register_readwrite.assert_called_once()
 
 
 def test_scoped_list_prefix_empty():
@@ -218,13 +311,14 @@ def _doctor_with_probe(probe, prefix="prefix"):
     with (
         patch("boto3.Session"),
         patch("git_remote_s3.manage.register_s3_access_grants"),
+        patch("git_remote_s3.manage.register_s3_access_grants_readwrite"),
         patch("git_remote_s3.manage.s3_region_kwargs", return_value={}),
         patch(
             "git_remote_s3.manage.register_s3_access_grants_strict",
             return_value=probe,
         ),
     ):
-        doctor = Doctor(None, "bucket", prefix, False)
+        doctor = Doctor(None, "bucket", prefix)
         doctor.check_access_grants()
 
 

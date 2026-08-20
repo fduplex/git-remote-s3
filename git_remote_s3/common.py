@@ -12,6 +12,7 @@ import urllib.parse
 
 import dns.exception
 import dns.resolver
+from aws_s3_access_grants_boto3_plugin.cache.cache_key import CacheKey
 from aws_s3_access_grants_boto3_plugin.s3_access_grants_plugin import (
     S3AccessGrantsPlugin,
 )
@@ -23,7 +24,7 @@ _MB = 1024**2
 
 # 16 MB parts keep per-request overhead low while still giving enough chunks to spread over the
 # 8 worker threads; going multipart above 25 MB also lifts the 5 GB single-PUT ceiling. Shared by
-# the bundle transfers in remote.py and the LFS object transfers in lfs.py.
+# the pack transfers in remote.py and the LFS object transfers in lfs.py.
 TRANSFER_CONFIG = TransferConfig(
     multipart_threshold=25 * _MB,
     multipart_chunksize=16 * _MB,
@@ -341,6 +342,34 @@ def _memoize_sts_caller_identity(plugin) -> None:
     sts_client.get_caller_identity = functools.lru_cache(maxsize=1)(get_caller_identity)
 
 
+class _ConditionalWritePlugin(S3AccessGrantsPlugin):
+    """The Access Grants plugin, vending READWRITE wherever the stock mapping would vend WRITE.
+
+    S3 conditional writes (``If-Match`` / ``If-None-Match`` on PutObject) evaluate s3:GetObject as
+    well as s3:PutObject, but the plugin maps ``put_object`` to WRITE and the session policy
+    GetDataAccess returns for WRITE carries no GetObject. The PUT is then denied on s3:GetObject
+    even though the underlying grant is READWRITE. Asking for READWRITE up front is the only way
+    to get a session policy that covers both halves of the conditional write.
+
+    ``_get_value_from_cache`` is the narrowest hook the plugin exposes: prefix resolution, the
+    credential caches (keyed on permission, so no cross-contamination with WRITE entries) and the
+    fallback behaviour are all left alone.
+    """
+
+    def _get_value_from_cache(self, cache_key, *args, **kwargs):
+        if getattr(cache_key, "permission", None) == "WRITE":
+            cache_key = CacheKey(permission="READWRITE", cache_key=cache_key)
+        return super()._get_value_from_cache(cache_key, *args, **kwargs)
+
+
+def _register_plugin(plugin, s3_client, *, notify_on_fallback=True):
+    plugin.register()
+    _memoize_sts_caller_identity(plugin)
+    if notify_on_fallback:
+        s3_client.meta.events.register("before-sign.s3", _detect_access_grants_fallback)
+    return s3_client
+
+
 def register_s3_access_grants(s3_client, session):
     """Registers the AWS S3 Access Grants plugin on an S3 client and returns it.
 
@@ -366,10 +395,28 @@ def register_s3_access_grants(s3_client, session):
         the same client, with the plugin and fallback detector registered.
     """
     plugin = S3AccessGrantsPlugin(s3_client, fallback_enabled=True, customer_session=session._session)
-    plugin.register()
-    _memoize_sts_caller_identity(plugin)
-    s3_client.meta.events.register("before-sign.s3", _detect_access_grants_fallback)
-    return s3_client
+    return _register_plugin(plugin, s3_client)
+
+
+def register_s3_access_grants_readwrite(s3_client, session):
+    """Registers the Access Grants plugin in READWRITE mode, for clients that write conditionally.
+
+    Identical to ``register_s3_access_grants`` except that PutObject vends a READWRITE session
+    rather than a WRITE one, which is what an ``If-Match`` / ``If-None-Match`` PUT needs: S3
+    evaluates s3:GetObject on a conditional write, and a WRITE session policy does not allow it.
+
+    Reserved for the manifest CAS client. Everything else (pack and LFS uploads) issues plain
+    PUTs and keeps the tighter WRITE session.
+
+    Args:
+        s3_client: a boto3 S3 client built on an already alias-resolved bucket name.
+        session: the boto3 ``Session`` the ``s3_client`` was created from.
+
+    Returns:
+        the same client, with the READWRITE plugin and fallback detector registered.
+    """
+    plugin = _ConditionalWritePlugin(s3_client, fallback_enabled=True, customer_session=session._session)
+    return _register_plugin(plugin, s3_client)
 
 
 def register_s3_access_grants_strict(s3_client, session):
@@ -391,6 +438,4 @@ def register_s3_access_grants_strict(s3_client, session):
         the same client, with the fallback-disabled plugin registered.
     """
     plugin = S3AccessGrantsPlugin(s3_client, fallback_enabled=False, customer_session=session._session)
-    plugin.register()
-    _memoize_sts_caller_identity(plugin)
-    return s3_client
+    return _register_plugin(plugin, s3_client, notify_on_fallback=False)

@@ -211,3 +211,30 @@ def test_upload_reports_error_on_non_404_head_object_failure():
     event = json.loads(stdout.getvalue().strip())
     assert event["event"] == "complete"
     assert event["error"]["code"] == 2
+
+
+@patch("git_remote_s3.lfs.time.monotonic")
+@patch("sys.stdout", new_callable=StringIO)
+def test_progress_percentage_throttles_rapid_updates(stdout_mock, monotonic_mock):
+    monotonic_mock.side_effect = [0.0, 0.01, 0.02, 0.03, 0.2, 0.21]
+    progress = lfs.ProgressPercentage("abc123")
+
+    for _ in range(6):
+        progress(1024)
+
+    # The first update always renders; after that only one per throttle window gets through.
+    assert stdout_mock.getvalue().count("\n") == 2
+
+
+@patch("sys.stdout", new_callable=StringIO)
+def test_progress_percentage_final_event_always_emits(stdout_mock):
+    progress = lfs.ProgressPercentage("abc123", total_bytes=2048)
+
+    progress(1024)
+    lines_after_first = stdout_mock.getvalue().count("\n")
+    progress(1024)  # reaches total_bytes; must emit even though the throttle window hasn't elapsed
+
+    lines = stdout_mock.getvalue().splitlines()
+    assert len(lines) == lines_after_first + 1
+    last_event = json.loads(lines[-1])
+    assert last_event == {"event": "progress", "oid": "abc123", "bytesSoFar": 2048, "bytesSinceLast": 1024}

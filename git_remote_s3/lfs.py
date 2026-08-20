@@ -8,6 +8,7 @@ import sys
 import logging
 import json
 import subprocess
+import time
 import boto3
 import threading
 import os
@@ -53,15 +54,33 @@ def _configure_logging() -> None:
         logging.basicConfig(level=logging.ERROR, format=log_format)
 
 
+# Rendering on every boto3 chunk (256 KiB) from up to 8 transfer threads costs far more writes
+# than git-lfs needs; a tenth of a second still reads as continuous progress.
+_PROGRESS_MIN_INTERVAL_S = 0.1
+
+
 class ProgressPercentage:
-    def __init__(self, oid: str):
+    """Emits git-lfs custom-transfer progress events on stdout.
+
+    boto3 invokes the callback from several transfer threads under multipart, so both the
+    counter and the write have to be serialised.
+    """
+
+    def __init__(self, oid: str, total_bytes: int | None = None):
         self._seen_so_far = 0
         self._lock = threading.Lock()
         self.oid = oid
+        self.total_bytes = total_bytes
+        self._rendered = False
+        self._last_render = 0.0
 
     def __call__(self, bytes_amount):
         with self._lock:
             self._seen_so_far += bytes_amount
+            now = time.monotonic()
+            is_final = self.total_bytes is not None and self._seen_so_far >= self.total_bytes
+            if self._rendered and not is_final and now - self._last_render < _PROGRESS_MIN_INTERVAL_S:
+                return
             progress_event = {
                 "event": "progress",
                 "oid": self.oid,
@@ -70,6 +89,8 @@ class ProgressPercentage:
             }
             sys.stdout.write(f"{json.dumps(progress_event)}\n")
             sys.stdout.flush()
+            self._rendered = True
+            self._last_render = now
 
 
 def write_error_event(*, oid: str, error: str, flush=False):
@@ -145,7 +166,7 @@ class LFSProcess:
             self.s3_bucket.upload_file(
                 event["path"],
                 key,
-                Callback=ProgressPercentage(event["oid"]),
+                Callback=ProgressPercentage(event["oid"], event.get("size")),
                 Config=TRANSFER_CONFIG,
             )
             sys.stdout.write(f"{json.dumps({'event': 'complete', 'oid': event['oid']})}\n")
@@ -163,7 +184,7 @@ class LFSProcess:
             self.s3_bucket.download_file(
                 Key=f"{self.prefix}/lfs/{event['oid']}",
                 Filename=f"{temp_dir}/{event['oid']}",
-                Callback=ProgressPercentage(event["oid"]),
+                Callback=ProgressPercentage(event["oid"], event.get("size")),
                 Config=TRANSFER_CONFIG,
             )
             done_event = {

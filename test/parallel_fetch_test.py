@@ -1,168 +1,146 @@
-from unittest.mock import patch
-from io import BytesIO
-from git_remote_s3 import S3Remote, UriScheme
+# SPDX-FileCopyrightText: 2023-present Amazon.com, Inc. or its affiliates
+#
+# SPDX-License-Identifier: Apache-2.0
+# Modifications Copyright 2026 FullDuplex Media
+# Changed: re-aimed at the WAL fetch, whose parallelism is over pack downloads, not over refs.
 
 import threading
+import time
+from unittest.mock import patch
+
+import pytest
+
+from git_remote_s3 import S3Remote, UriScheme, gitwal
+from git_remote_s3 import remote as remote_module
+from remote_test import ManifestStore, wal_manifest
 
 SHA1 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8a"
 SHA2 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8b"
 SHA3 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8c"
 BRANCH = "pytest"
-MOCK_BUNDLE_CONTENT = b"MOCK_BUNDLE_CONTENT"
+REF = f"refs/heads/{BRANCH}"
+URL = "s3://test_bucket/test_prefix"
+
+
+@pytest.fixture(autouse=True)
+def _no_git_config(monkeypatch):
+    """Keeps the imported-seq and region caches off the project's own git config."""
+    monkeypatch.setattr(remote_module, "_git_config_get", lambda key: None)
+    monkeypatch.setattr(remote_module, "_git_config_run", lambda *args: None)
+    monkeypatch.setattr(remote_module, "maybe_install_lfs_agent", lambda remote_name: None)
+
+
+def _entries(*shas):
+    return [gitwal.Entry(seq=i + 1, pack=f"packs/{sha}.pack", bytes=64, tips={REF: sha}) for i, sha in enumerate(shas)]
+
+
+def _remote(client, *shas):
+    ManifestStore(client, manifest=wal_manifest({REF: shas[-1]}, entries=_entries(*shas)))
+    return S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix", remote_name="origin", remote_url=URL)
 
 
 @patch("boto3.Session.client")
 def test_process_fetch_cmds_empty_list(session_client_mock):
-    """Test that process_fetch_cmds handles empty command list gracefully"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
+    S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").process_fetch_cmds([])
 
-    # Call with empty list
-    s3_remote.process_fetch_cmds([])
-
-    # Verify no interactions with S3
     session_client_mock.return_value.get_object.assert_not_called()
 
 
-@patch("git_remote_s3.git.unbundle")
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
 @patch("boto3.Session.client")
-def test_process_fetch_cmds_single_command(session_client_mock, unbundle_mock):
-    """Test processing a single fetch command"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
+def test_one_entry_is_one_download_and_one_index(session_client_mock, index_pack_mock, resolves_mock):
+    client = session_client_mock.return_value
 
-    # Process a single fetch command
-    s3_remote.process_fetch_cmds([f"fetch {SHA1} refs/heads/{BRANCH}"])
+    _remote(client, SHA1).process_fetch_cmds([f"fetch {SHA1} {REF}"])
 
-    # Verify S3 download_file was called once
-    session_client_mock.return_value.download_file.assert_called_once()
-    unbundle_mock.assert_called_once()
-
-    # Verify the fetched_refs list contains the SHA
-    assert SHA1 in s3_remote.fetched_refs
+    client.download_file.assert_called_once()
+    index_pack_mock.assert_called_once()
 
 
-@patch("git_remote_s3.git.unbundle")
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
 @patch("boto3.Session.client")
-def test_process_fetch_cmds_multiple_commands(session_client_mock, unbundle_mock):
-    """Test processing multiple fetch commands in parallel"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
+def test_every_entry_of_the_log_is_downloaded_and_indexed(session_client_mock, index_pack_mock, resolves_mock):
+    client = session_client_mock.return_value
 
-    # Process multiple fetch commands
-    fetch_cmds = [
-        f"fetch {SHA1} refs/heads/{BRANCH}",
-        f"fetch {SHA2} refs/heads/{BRANCH}",
-        f"fetch {SHA3} refs/heads/{BRANCH}",
+    _remote(client, SHA1, SHA2, SHA3).process_fetch_cmds([f"fetch {SHA3} {REF}"])
+
+    assert [c.kwargs["Key"] for c in client.download_file.call_args_list] == [
+        f"test_prefix/packs/{sha}.pack" for sha in (SHA1, SHA2, SHA3)
     ]
-    s3_remote.process_fetch_cmds(fetch_cmds)
-
-    # Verify S3 download_file was called for each command
-    assert session_client_mock.return_value.download_file.call_count == 3
-    assert unbundle_mock.call_count == 3
-
-    # Verify all SHAs are in the fetched_refs list
-    assert SHA1 in s3_remote.fetched_refs
-    assert SHA2 in s3_remote.fetched_refs
-    assert SHA3 in s3_remote.fetched_refs
+    assert index_pack_mock.call_count == 3
 
 
-@patch("git_remote_s3.git.unbundle")
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
 @patch("boto3.Session.client")
-def test_process_fetch_cmds_uses_thread_pool(session_client_mock, unbundle_mock):
-    """Test that process_fetch_cmds uses a thread pool for parallel execution"""
-    # This test verifies that the ThreadPoolExecutor is used by checking that
-    # multiple commands are processed in parallel
+def test_pack_downloads_overlap(session_client_mock, index_pack_mock, resolves_mock):
+    """The packs of one import are downloaded concurrently, which is where the wall time is."""
+    client = session_client_mock.return_value
+    in_flight = set()
+    overlapped = threading.Event()
+    lock = threading.Lock()
 
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
+    def download_file(*, Key, **kwargs):
+        with lock:
+            in_flight.add(Key)
+            if len(in_flight) > 1:
+                overlapped.set()
+        time.sleep(0.05)
+        with lock:
+            in_flight.discard(Key)
 
-    # Create fetch commands
-    fetch_cmds = [
-        f"fetch {SHA1} refs/heads/{BRANCH}",
-        f"fetch {SHA2} refs/heads/{BRANCH}",
-        f"fetch {SHA3} refs/heads/{BRANCH}",
-    ]
+    client.download_file.side_effect = download_file
 
-    # Process the commands
-    s3_remote.process_fetch_cmds(fetch_cmds)
+    _remote(client, SHA1, SHA2, SHA3).process_fetch_cmds([f"fetch {SHA3} {REF}"])
 
-    # Verify all commands were processed
-    assert session_client_mock.return_value.download_file.call_count == 3
-    assert unbundle_mock.call_count == 3
-
-    # Verify all SHAs are in the fetched_refs list
-    assert SHA1 in s3_remote.fetched_refs
-    assert SHA2 in s3_remote.fetched_refs
-    assert SHA3 in s3_remote.fetched_refs
+    assert overlapped.is_set()
 
 
-@patch("sys.stdin")
-@patch("git_remote_s3.git.unbundle")
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
 @patch("boto3.Session.client")
-def test_process_cmd_batch_processing(session_client_mock, unbundle_mock, stdin_mock):
-    """Test that fetch commands are collected and processed in batch"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
+def test_indexing_is_serialised_after_the_downloads(session_client_mock, index_pack_mock, resolves_mock):
+    # git index-pack writes into one object database; the packs are downloaded in parallel and
+    # imported one at a time.
+    client = session_client_mock.return_value
+    concurrent_indexes = []
+    active = []
+    lock = threading.Lock()
 
-    # Simulate processing multiple fetch commands followed by an empty line
-    s3_remote.process_cmd(f"fetch {SHA1} refs/heads/{BRANCH}")
-    s3_remote.process_cmd(f"fetch {SHA2} refs/heads/{BRANCH}")
-    s3_remote.process_cmd(f"fetch {SHA3} refs/heads/{BRANCH}")
+    def index_pack(*, path, **kwargs):
+        with lock:
+            active.append(path)
+            concurrent_indexes.append(len(active))
+        time.sleep(0.01)
+        with lock:
+            active.remove(path)
 
-    # Verify commands are collected but not processed yet
+    index_pack_mock.side_effect = index_pack
+
+    _remote(client, SHA1, SHA2, SHA3).process_fetch_cmds([f"fetch {SHA3} {REF}"])
+
+    assert concurrent_indexes == [1, 1, 1]
+
+
+@patch("git_remote_s3.git.has_complete_history", return_value=True)
+@patch("git_remote_s3.git.index_pack")
+@patch("boto3.Session.client")
+def test_process_cmd_batches_fetches_until_the_blank_line(session_client_mock, index_pack_mock, resolves_mock):
+    client = session_client_mock.return_value
+    s3_remote = _remote(client, SHA1, SHA2, SHA3)
+
+    s3_remote.process_cmd(f"fetch {SHA1} {REF}")
+    s3_remote.process_cmd(f"fetch {SHA2} {REF}")
+    s3_remote.process_cmd(f"fetch {SHA3} {REF}")
+
     assert len(s3_remote.fetch_cmds) == 3
-    unbundle_mock.assert_not_called()
+    client.download_file.assert_not_called()
 
-    # Process the empty line to trigger batch processing
-    with patch("git_remote_s3.remote.S3Remote.process_fetch_cmds") as mock_process:
+    with patch("git_remote_s3.remote.S3Remote.process_fetch_cmds") as process_fetch_cmds:
         s3_remote.process_cmd("\n")
 
-        # Verify process_fetch_cmds was called with all collected commands
-        mock_process.assert_called_once()
-        assert len(mock_process.call_args[0][0]) == 3
-
-        # Verify fetch_cmds is cleared after processing
-        assert len(s3_remote.fetch_cmds) == 0
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_thread_safety_of_fetched_refs(session_client_mock, unbundle_mock):
-    """Test thread safety of the fetched_refs list using a real thread pool"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
-
-    # Create multiple fetch commands with different SHAs
-    fetch_cmds = [f"fetch {SHA1} refs/heads/{BRANCH}"] * 20
-
-    # Process commands using a real thread pool
-    s3_remote.process_fetch_cmds(fetch_cmds)
-
-    # Verify SHA1 appears in fetched_refs
-    assert SHA1 in s3_remote.fetched_refs
-
-
-@patch("git_remote_s3.git.unbundle")
-@patch("boto3.Session.client")
-def test_cmd_fetch_thread_safety(session_client_mock, unbundle_mock):
-    """Test that cmd_fetch is thread-safe when called concurrently"""
-    s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {"Body": BytesIO(MOCK_BUNDLE_CONTENT)}
-
-    # Create a function that simulates concurrent access
-    def concurrent_fetch():
-        s3_remote.cmd_fetch(f"fetch {SHA1} refs/heads/{BRANCH}")
-
-    # Create and start multiple threads
-    threads = []
-    for _ in range(5):
-        thread = threading.Thread(target=concurrent_fetch)
-        threads.append(thread)
-        thread.start()
-
-    # Wait for all threads to complete
-    for thread in threads:
-        thread.join()
-
-    # Verify SHA1 appears in fetched_refs
-    assert SHA1 in s3_remote.fetched_refs
+    process_fetch_cmds.assert_called_once()
+    assert len(process_fetch_cmds.call_args[0][0]) == 3
+    assert s3_remote.fetch_cmds == []
