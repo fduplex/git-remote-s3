@@ -1,33 +1,29 @@
 # git-remote-s3
 
+This library enables to use Amazon S3 as a git remote and LFS server. It provides an implementation of a
+[git remote helper](https://git-scm.com/docs/gitremote-helpers) to use S3 as a serverless Git server, and an
+implementation of the
+[git-lfs custom transfer](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md) to enable pushing
+LFS managed files to the same S3 bucket used as remote.
+
 ## About this fork
 
 This is a fork of [awslabs/git-remote-s3](https://github.com/awslabs/git-remote-s3), licensed under the
-Apache License 2.0 (unchanged). Notable additions in this fork:
+Apache License 2.0 (unchanged). Not affiliated with or endorsed by Amazon Web Services.
 
-- Fix for LFS temp-file paths when the repo is used as a submodule
-- Per-remote LFS scoping, so a repo can mix an S3 LFS remote with non-S3 remotes
-- Auto-install of the LFS transfer agent on first remote-helper run, scoped per remote (never the repo-wide `lfs.standalonetransferagent`)
-- Pushes no longer stall ~10s per push on git-lfs's pure-SSH endpoint probe of the `s3://` URL — the auto-install writes `remote.<name>.lfsurl`, which suppresses it
+What this fork adds on top of upstream:
+
+- LFS fixes: per-remote scoping so an S3 LFS remote can coexist with non-S3 ones, auto-install of the transfer agent
+  on first remote-helper run, correct temp-file paths when the repo is a submodule, and no ~10s stall per push on
+  git-lfs's pure-SSH endpoint probe of the `s3://` URL
 - DNS TXT bucket-alias resolution for `s3://` remote URIs
-- S3 Access Grants support, region-aware S3 clients, and a `git-s3 doctor` diagnostic command
-- Doctor repairs are safe for nested remote prefixes (e.g. `s3://bucket/team/repo`): keys are parsed relative to the repo prefix, and the LFS object store is never mistaken for a branch
-- Pushing from a shallow clone is rejected with a clear error telling you to run `git fetch --unshallow` first, instead of silently uploading a truncated pack
+- S3 Access Grants support and region-aware S3 clients
+- `git-s3 doctor`, a read-only auditor that never writes or deletes anything and is safe to run against nested
+  remote prefixes (e.g. `s3://bucket/team/repo`)
+- Pushing from a shallow clone is rejected with a clear error instead of silently uploading a truncated pack
 - Partial clones (`git clone --filter=blob:none` / `--filter=tree:0`) are fully supported for push and fetch
-- Push and fetch render live transfer progress on the terminal, honoring `git push --quiet` / `--progress`
-- `--force-with-lease` is supported with real compare-and-swap semantics against the remote ref, not just a `+` force push
-
-Not affiliated with or endorsed by Amazon Web Services.
-
-This fork is published on PyPI as `fduplex-git-remote-s3`, but it installs the same `git-remote-s3`
-command as upstream and therefore replaces it, so a given environment should install
-`fduplex-git-remote-s3` or upstream `git-remote-s3`, not both.
-
-This library enables to use Amazon S3 as a git remote and LFS server.
-
-It provides an implementation of a [git remote helper](https://git-scm.com/docs/gitremote-helpers) to use S3 as a serverless Git server.
-
-It also provide an implementation of the [git-lfs custom transfer](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md) to enable pushing LFS managed files to the same S3 bucket used as remote.
+- Push and fetch render live transfer progress, honoring `git push --quiet` / `--progress`
+- `--force-with-lease` with real compare-and-swap semantics against the remote ref, not just a `+` force push
 
 ## Table of Contents
 
@@ -39,36 +35,48 @@ It also provide an implementation of the [git-lfs custom transfer](https://githu
 - [Use S3 remotes](#use-s3-remotes)
   - [Create a new repo](#create-a-new-repo)
   - [Clone a repo](#clone-a-repo)
-  - [DNS bucket aliases](#dns-bucket-aliases)
-  - [Bucket region cache](#bucket-region-cache)
-  - [S3 Access Grants](#s3-access-grants)
   - [Branches, etc.](#branches-etc)
   - [Using S3 remotes for submodules](#using-s3-remotes-for-submodules)
+  - [DNS bucket aliases](#dns-bucket-aliases)
+  - [S3 Access Grants](#s3-access-grants)
 - [LFS](#lfs)
-  - [Fetching through a facade URL (uv and friends)](#fetching-through-a-facade-url-uv-and-friends)
+  - [Install the transfer agent](#install-the-transfer-agent)
   - [Creating the repo and pushing](#creating-the-repo-and-pushing)
   - [Clone the repo](#clone-the-repo)
-- [Notes about specific behaviors of Amazon S3 remotes](#notes-about-specific-behaviors-of-amazon-s3-remotes)
-  - [Arbitrary Amazon S3 URIs](#arbitrary-amazon-s3-uris)
-  - [Concurrency and locking](#concurrency-and-locking)
+  - [Coexisting with other LFS remotes](#coexisting-with-other-lfs-remotes)
+  - [Fetching through a facade URL (uv and friends)](#fetching-through-a-facade-url-uv-and-friends)
 - [Manage the Amazon S3 remote](#manage-the-amazon-s3-remote)
   - [Delete branches](#delete-branches)
   - [Protected branches](#protected-branches)
+  - [Compact the remote](#compact-the-remote)
+  - [Migrate a legacy repo](#migrate-a-legacy-repo)
+  - [git-s3 doctor](#git-s3-doctor)
+- [Notes about specific behaviors of Amazon S3 remotes](#notes-about-specific-behaviors-of-amazon-s3-remotes)
+  - [Arbitrary Amazon S3 URIs](#arbitrary-amazon-s3-uris)
 - [Under the hood](#under-the-hood)
-  - [How S3 remote work](#how-s3-remote-work)
-  - [How LFS work](#how-lfs-work)
+  - [How S3 remotes work](#how-s3-remotes-work)
+  - [Concurrency and locking](#concurrency-and-locking)
+  - [Bucket region cache](#bucket-region-cache)
+  - [DNS alias resolution](#dns-alias-resolution)
+  - [Imported-entry high-water mark](#imported-entry-high-water-mark)
+  - [Access Grants and IAM](#access-grants-and-iam)
+  - [How LFS works](#how-lfs-works)
   - [Debugging](#debugging)
 - [Credits](#credits)
 
 ## Installation
 
-`git-remote-s3` is a Python script and works with any Python version >= 3.9.
+`git-remote-s3` is a Python script and works with any Python version >= 3.10.
 
 Run:
 
 ```
 pip install fduplex-git-remote-s3
 ```
+
+This fork is published on PyPI as `fduplex-git-remote-s3`, but it installs the same `git-remote-s3`
+command as upstream and therefore replaces it, so a given environment should install
+`fduplex-git-remote-s3` or upstream `git-remote-s3`, not both.
 
 ## Prerequisites
 
@@ -80,7 +88,7 @@ Before you can use `git-remote-s3`, you must:
   - Configuring an IAM user or role
 
 - Create an AWS S3 bucket (or have one already) in your AWS account.
-- Attach a minimal policy to that user/role that allows the to the S3 bucket:
+- Attach a minimal policy to that user/role that allows access to the S3 bucket:
 
   ```json
   {
@@ -102,17 +110,6 @@ Before you can use `git-remote-s3`, you must:
   }
   ```
 
-- Optional (but recommended) - use [SSE-KMS Bucket keys to encrypt the content of the bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html), ensure the user/role create previously has the permission to access and use the key.
-
-```json
-{
-  "Sid": "KMSAccess",
-  "Effect": "Allow",
-  "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
-  "Resource": ["arn:aws:kms:<REGION>:<ACCOUNT>:key/<KEY_ID>"]
-}
-```
-
 - Install Python and its package manager, pip, if they are not already installed. To download and install the latest version of Python, [visit the Python website](https://www.python.org/).
 - Install Git on your Linux, macOS, Windows, or Unix computer.
 - Install the latest version of the AWS CLI on your Linux, macOS, Windows, or Unix computer. You can find instructions [here](https://docs.aws.amazon.com/cli/latest/userguide/installing.html).
@@ -122,6 +119,17 @@ Before you can use `git-remote-s3`, you must:
 ### Data encryption
 
 All data is encrypted at rest and in transit by default. To add an additional layer of security you can use customer managed KMS keys to encrypt the data at rest on the S3 bucket. We recommend to use [Bucket keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html) to minimize the KMS costs.
+
+Optional (but recommended) - use [SSE-KMS Bucket keys to encrypt the content of the bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html), ensuring the user/role created previously has the permission to access and use the key:
+
+```json
+{
+  "Sid": "KMSAccess",
+  "Effect": "Allow",
+  "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+  "Resource": ["arn:aws:kms:<REGION>:<ACCOUNT>:key/<KEY_ID>"]
+}
+```
 
 ### Access control
 
@@ -152,15 +160,18 @@ If you store multiple repos in a single bucket but would like to separate permis
           "s3:ListBucket",
         ],
         "Condition": {
-          "StringEquals": {
-            "s3:prefix": "<REPO>"
+          "StringLike": {
+            "s3:prefix": "<REPO>/*"
           }
         },
         "Resource": ["arn:aws:s3:::<BUCKET>"]
       },
 ```
 
-Using the condition key restricts the access operation to the content of the specific repo in the bucket.
+Using the condition key restricts the access operation to the content of the specific repo in the bucket. Every listing call this
+tool makes goes through a helper that appends a trailing slash to the prefix (so `<REPO>` doesn't also match a sibling repo like
+`<REPO>-other`), so the condition has to match `<REPO>/` and everything under it, not `<REPO>` alone: use `StringLike` with
+`<REPO>/*`, not `StringEquals` with `<REPO>`.
 
 ## Use S3 remotes
 
@@ -184,9 +195,13 @@ git commit -a -m "hello"
 git push --set-upstream origin main
 ```
 
-The remote HEAD is set to track the branch that has been pushed first to the remote repo. To change the remote HEAD branch, run `git-s3 head s3://<bucket>/<prefix> <branch>`.
+The remote HEAD is set to track the branch that has been pushed first to the remote repo. To change the remote HEAD branch, run `git-s3 head <remote> <branch>`.
 
-`s3+zip://` is accepted for back-compat but is deprecated and now behaves exactly like `s3://`: no `repo.zip` archive is written. Use `s3://` for new remotes.
+`s3+zip://` is accepted for back-compat and behaves exactly like `s3://`: no `repo.zip` archive is written, so use
+`s3://` for new remotes. Because PyPI does not permit the `+` character in an installed command name, the
+`git-remote-s3+zip` helper binary is not installed; if you still have `s3+zip://` remotes, create the helper once as
+an alias of the `s3` helper, e.g. `ln -s "$(command -v git-remote-s3)" ~/.local/bin/git-remote-s3+zip` (or copy it
+to a directory on your `PATH` on Windows).
 
 ### Clone a repo
 
@@ -196,105 +211,12 @@ To clone the repo to another folder just use the normal git syntax using the s3 
 git clone s3://my-git-bucket/my-repo my-repo-clone
 ```
 
-### DNS bucket aliases
+If the repo uses LFS, the transfer agent is auto-configured on clone, so no extra setup is needed; set
+`GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out (details in [How LFS works](#how-lfs-works)).
 
-> **Fork addition** (not in upstream awslabs/git-remote-s3): the bucket component of the remote URI can be a DNS hostname aliasing the real bucket.
-
-When the bucket component of the remote URI contains at least one dot, it is treated as a DNS hostname instead of a literal bucket name (bucket names used with this feature must not contain dots). The hostname is resolved to the real bucket name via a DNS TXT lookup using the system resolver, so split-horizon/VPN DNS setups work as usual:
-
-- A TXT record must exist at the alias hostname itself.
-- Among its TXT values, exactly one must have the form `git-bucket=<real-bucket-name>`; other TXT values at the same name are ignored.
-
-For example, with the record
-
-```
-repos.git.example.com. 300 IN TXT "git-bucket=my-git-bucket-123456789012-us-east-2"
-```
-
-the following commands are equivalent:
-
-```bash
-git clone s3://repos.git.example.com/my-repo
-git clone s3://my-git-bucket-123456789012-us-east-2/my-repo
-```
-
-Aliases work in every place a remote URI is accepted: the git remote helper, the `git-lfs-s3` transfer agent and `git-lfs-s3 install --remote`, and the `git-s3` management CLI. Resolution results are cached for the lifetime of the process. If the alias has no TXT record or no `git-bucket=` value, the command fails with an error describing the expected record instead of falling back to using the hostname as a bucket name.
-
-Alias resolution is enabled by default and can be disabled via git config, so a dotted bucket component is treated as a literal bucket name again:
-
-```bash
-# per remote (takes precedence when set):
-git config remote.origin.s3-dns-alias false
-# for all remotes (used when the per-remote key is unset or no remote name is known):
-git config s3.dns-alias false
-```
-
-Both keys are booleans; setting the per-remote key to `true` re-enables aliasing for that remote even when `s3.dns-alias` is `false`. The per-remote key applies where a remote name is available (the git remote helper, the LFS transfer agent, `git-lfs-s3 install --remote`); the `git-s3` CLI takes a URI rather than a remote name and honors only `s3.dns-alias`.
-
-### Bucket region cache
-
-> **Fork addition** (not in upstream awslabs/git-remote-s3): the bucket's region is detected once and remembered in the repo's local git config.
-
-Every S3 client the remote helper builds is pinned to the bucket's own region, which otherwise costs a `HeadBucket` round trip on every single git command. The first successful detection is written to the repo-local git config as `remote.<name>.s3region`, and every later invocation reads it from there instead:
-
-```bash
-git config --get remote.origin.s3region
-# eu-west-1
-```
-
-The value is written on the first clone, fetch or push against a remote, and only for a real remote name — a push straight to a URI (`git push s3://bucket/repo ...`) detects the region and does not cache it. For submodules the key lands in the submodule's own config under `.git/modules/<name>/config`.
-
-If a bucket ever moves to another region, the cached value goes stale. The helper notices the redirect S3 returns, drops the key and retries once, so the operation still succeeds; you can also clear it by hand:
-
-```bash
-git config --unset remote.origin.s3region
-```
-
-### Imported-entry high-water mark
-
-> **Fork addition** (not in upstream awslabs/git-remote-s3): a fetch remembers how far down the manifest's entry log it has already imported.
-
-`remote.<name>.gitwal-seq` records the highest `gitwal.json` entry seq imported into this clone, so a routine fetch downloads only the packs added since. It is a hint, never state: after importing, the client verifies the fetched tips with `git rev-list --objects` and, when they do not resolve, keeps pulling older entries until they do. A stale or hand-edited value costs a round trip, never correctness, and the key is written only after verification passes.
-
-```bash
-git config --get remote.origin.gitwal-seq
-# 43
-```
-
-As with the region cache, a fetch straight to a URI has no remote section to write to and re-imports from the start of the log.
-
-### S3 Access Grants
-
-> **Fork addition** (not in upstream awslabs/git-remote-s3): the [AWS S3 Access Grants boto3 plugin](https://github.com/awslabs/aws-s3-access-grants-plugin-boto3) is bundled and auto-registered on every S3 client this tool builds — the git remote helper, the `git-lfs-s3` transfer agent, and the `git-s3` management CLI.
-
-Registration is transparent and always runs with fallback enabled, so a single code path serves both credential models:
-
-- A caller whose identity holds an S3 Access Grant gets short-lived, prefix-scoped credentials vended by Access Grants for each S3 operation.
-- A caller using plain IAM credentials (an access-key user or a role with direct S3 policy access and no grant) transparently falls back to a direct S3 call — no configuration needed.
-
-On the first fallback in a process a one-time notice is printed to stderr; it points you at `git-s3 doctor` (below) if you *expected* Access Grants to be used.
-
-#### IAM permissions for the Access Grants path
-
-To use Access Grants, the caller role/identity needs **both** of these actions on the Access Grants instance resource:
-
-- `s3:GetDataAccess` — vends the scoped credentials.
-- `s3:GetAccessGrantsInstanceForPrefix` — resolves which account owns the Access Grants instance for the requested `s3://bucket/prefix`.
-
-The plugin calls `GetAccessGrantsInstanceForPrefix` **before** it can call `GetDataAccess`, because it must first learn the owner account id to target. This is a separate IAM action that is easy to overlook: if the caller has `s3:GetDataAccess` but not `s3:GetAccessGrantsInstanceForPrefix`, the plugin fails during that preflight and — because fallback is enabled — **silently** drops to direct S3 credentials. The user then sees only a misleading downstream `AccessDenied` from the direct call (or a successful direct call that never used Access Grants at all), with nothing pointing at the real cause. Grant both actions together.
-
-#### Diagnosing with `git-s3 doctor`
-
-`git-s3 doctor <remote>` runs an Access Grants entitlement check as its own section. Unlike the normal path, this check runs the plugin with fallback **disabled** and drives the full vend path (including the `GetAccessGrantsInstanceForPrefix` preflight) against the repo's prefix, so it surfaces the real error the fallback would otherwise hide. It reports:
-
-- `Access Grants: OK` when credentials were vended for the repo prefix.
-- `Access Grants: not available (using direct S3 credentials)` on an `AccessDenied`, naming the exact failing operation and the missing permission — e.g. `caller role is missing s3:GetAccessGrantsInstanceForPrefix` or `caller role is missing s3:GetDataAccess or has no matching grant`.
-
-This is informational: an IAM-key user with no grant legitimately reports "not available" and keeps working via direct credentials — that is expected, not an error.
-
-#### Bucket region auto-detection
-
-The S3 client is automatically pinned to the bucket's real region, detected via a `HeadBucket` probe (which returns the region even for an unauthorized caller, so it needs no extra permission and is cached per process). You do **not** need your default region to match the bucket's region; if the region cannot be determined the tool proceeds with your default region and S3's cross-region redirects, exactly as before.
+The bucket's region is detected once and remembered in the repo-local git config as `remote.<name>.s3region`, so
+later commands skip the `HeadBucket` round trip. You never need your default region to match the bucket's. Clear it
+with `git config --unset remote.origin.s3region`; see [Bucket region cache](#bucket-region-cache) for the details.
 
 ### Branches, etc.
 
@@ -325,7 +247,60 @@ Or, to enable globally:
 git config --global protocol.s3.allow always
 ```
 
+### DNS bucket aliases
+
+When the bucket component of the remote URI contains at least one dot, it is treated as a DNS hostname aliasing the
+real bucket instead of a literal bucket name (bucket names used with this feature must not contain dots). The
+hostname is resolved to the real bucket name via a DNS TXT lookup using the system resolver, so split-horizon/VPN
+DNS setups work as usual. For example, with the record
+
+```
+repos.git.example.com. 300 IN TXT "git-bucket=my-git-bucket-123456789012-us-east-2"
+```
+
+the following commands are equivalent:
+
+```bash
+git clone s3://repos.git.example.com/my-repo
+git clone s3://my-git-bucket-123456789012-us-east-2/my-repo
+```
+
+Aliasing is on by default and can be turned off, so a dotted bucket component is treated as a literal bucket name
+again:
+
+```bash
+# per remote (takes precedence when set):
+git config remote.origin.s3-dns-alias false
+# for all remotes (used when the per-remote key is unset or no remote name is known):
+git config s3.dns-alias false
+```
+
+See [DNS alias resolution](#dns-alias-resolution) for the record format, where aliases are accepted, and how the two
+config keys interact.
+
+### S3 Access Grants
+
+The [AWS S3 Access Grants boto3 plugin](https://github.com/awslabs/aws-s3-access-grants-plugin-boto3) is bundled and
+auto-registered on every S3 client this tool builds — the git remote helper, the `git-lfs-s3` transfer agent, and
+the `git-s3` management CLI. There is nothing to configure:
+
+- A caller whose identity holds an S3 Access Grant gets short-lived, prefix-scoped credentials vended by Access
+  Grants for each S3 operation.
+- A caller using plain IAM credentials (an access-key user or a role with direct S3 policy access and no grant)
+  transparently falls back to a direct S3 call — no configuration needed.
+
+To use the Access Grants path, the caller role/identity needs **both** `s3:GetDataAccess` and
+`s3:GetAccessGrantsInstanceForPrefix` on the Access Grants instance resource. Grant them together: missing the
+second one makes the tool silently fall back to direct credentials, which is exactly the failure mode
+[Access Grants and IAM](#access-grants-and-iam) explains.
+
+On the first fallback in a process a one-time notice is printed to stderr. If you *expected* Access Grants to be
+used, run [`git-s3 doctor`](#git-s3-doctor): it runs a dedicated entitlement check and names the missing
+permission.
+
 ## LFS
+
+### Install the transfer agent
 
 To use LFS you need to first install git-lfs. You can refer to the [official documentation](https://git-lfs.com/) on how to do this on your system.
 
@@ -341,12 +316,45 @@ git-lfs-s3 install
 
 `--remote` writes a per-remote scoped configuration so `git-lfs-s3` only fires for that one remote — letting an S3 remote coexist with non-S3 LFS remotes (e.g. GitHub, GitLab) without breaking their LFS push/pull. Use it whenever the repo has more than one remote.
 
-The bare `git-lfs-s3 install` form sets `lfs.standalonetransferagent` globally and is short for:
+### Creating the repo and pushing
+
+Let's assume we want to store TIFF file in LFS.
 
 ```bash
-git config --add lfs.customtransfer.git-lfs-s3.path git-lfs-s3
-git config --add lfs.standalonetransferagent git-lfs-s3
+mkdir lfs-repo
+cd lfs-repo
+git init
+git lfs install
+git remote add origin s3://my-git-bucket/lfs-repo
+git-lfs-s3 install --remote origin
+git lfs track "*.tiff"
+git add .gitattributes
+<put file.tiff in the repo>
+git add file.tiff
+git commit -a -m "my first tiff file"
+git push --set-upstream origin main
 ```
+
+### Clone the repo
+
+```bash
+git clone s3://my-git-bucket/lfs-repo lfs-repo-clone
+```
+
+`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone`
+and `git submodule add` work without extra setup. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; see
+[How LFS works](#how-lfs-works) for exactly what it writes and when it stays out of the way.
+
+### Coexisting with other LFS remotes
+
+The bare `git-lfs-s3 install` form sets `lfs.standalonetransferagent` in the current repo (not globally) and is short for:
+
+```bash
+git config --replace-all lfs.customtransfer.git-lfs-s3.path git-lfs-s3
+git config --replace-all lfs.standalonetransferagent git-lfs-s3
+```
+
+`--replace-all` means re-running it is idempotent: it overwrites the existing value instead of accumulating duplicates.
 
 `git-lfs-s3 install --remote <name>` instead writes:
 
@@ -382,32 +390,64 @@ git config --global lfs."https://s3".standalonetransferagent git-lfs-s3
 
 The agent re-applies the `insteadOf` mapping itself (longest matching prefix wins, same as git) to recover the `s3://` URI, so the fetch works with no remote configured. Without a matching `insteadOf` entry it fails the transfer with an error naming the URL it could not map.
 
-### Creating the repo and pushing
+## Manage the Amazon S3 remote
 
-Let's assume we want to store TIFF file in LFS.
+### Delete branches
+
+To remove remote branches that are not used anymore you can use the `git-s3 delete-branch <remote> <branch_name>` command. This is a refs-only change: a conditional PUT drops the branch from the manifest. The packs it uniquely referenced stay in the bucket until `git-s3 compact` supersedes them.
+
+### Protected branches
+
+To protect/unprotect a branch run `git s3 protect <remote> <branch-name>` respectively `git s3 unprotect <remote> <branch-name>`.
+
+### Compact the remote
+
+`git-s3 compact <remote>` collapses the manifest's whole entry log into a single base pack covering every current
+ref, then deletes the packs it superseded. The same pass reclaims orphans — packs no manifest entry has ever named
+— once they are older than the grace period (24h by default, `--prune-orphans-older-than <duration>`; values under
+1h require `--yes`). `git-s3 compact` is the only command that reclaims packs. See
+[How S3 remotes work](#how-s3-remotes-work) for why the log grows and what the grace period protects.
+
+### Migrate a legacy repo
+
+Repos created before 0.6 used a per-ref bundle-file format instead of the `gitwal.json` manifest.
+[`git-s3 doctor <remote>`](#git-s3-doctor) reports `gitwal.json: missing (this repo has not been migrated)` on one
+of these. Bring it forward in two steps:
 
 ```bash
-mkdir lfs-repo
-cd lfs-repo
-git init
-git lfs install
-git remote add origin s3://my-git-bucket/lfs-repo
-git-lfs-s3 install --remote origin
-git lfs track "*.tiff"
-git add .gitattributes
-<put file.tiff in the repo>
-git add file.tiff
-git commit -a -m "my first tiff file"
-git push --set-upstream origin main
+git-s3 migrate <remote>
 ```
 
-### Clone the repo
+This is phase 1: it reads every `refs/.../*.bundle` key, packs their tips into a single base pack, and writes
+`gitwal.json` (carrying the legacy HEAD and protected markers across) alongside the legacy keys. Nothing legacy is
+touched or deleted, so the old and new formats are both live and correct at once — check the migrated repo before
+committing to it: run `git-s3 doctor <remote>`, and do a real clone and push through the new client. Roll back by
+deleting what phase 1 wrote (`gitwal.json` and `packs/`); the legacy keys are untouched.
+
+Once you're satisfied, finalize:
 
 ```bash
-git clone s3://my-git-bucket/lfs-repo lfs-repo-clone
+git-s3 migrate --finalize --yes <remote>
 ```
 
-`git-remote-s3` installs the LFS transfer agent in the new repo's local config on first invocation, so `git clone` and `git submodule add` work without extra setup. It writes exactly the same per-remote keys as `git-lfs-s3 install --remote <name>` — `lfs.customtransfer.git-lfs-s3.path`, `remote.<name>.lfsurl` and the URL-scoped `lfs.<url>.standalonetransferagent` — and never the repo-wide `lfs.standalonetransferagent`. Set `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` to opt out; an existing `lfs.standalonetransferagent` naming another agent, or an existing `remote.<name>.lfsurl`, suppresses the install entirely, and nothing is written for a remote that is not an `s3://` URL.
+This deletes the pre-migration bundle keys. It is irreversible, which is why it needs both `--finalize` and `--yes`.
+
+`git-s3 head <remote>` with no branch argument is also valid: it's a read (no CAS, no write) that just prints the
+remote's current default branch and whether it resolves.
+
+### git-s3 doctor
+
+`git-s3 doctor <remote>` audits a repo's manifest and packs: schema validation, missing packs, orphan packs,
+whether compaction is due, and an Access Grants entitlement check. It is a read-only auditor — it never writes or
+deletes anything, and is safe to run against nested remote prefixes (e.g. `s3://bucket/team/repo`).
+
+The Access Grants section runs the plugin with fallback **disabled** and drives the full vend path against the
+repo's prefix, so it surfaces the real error the fallback would otherwise hide. It reports:
+
+- `Access Grants: OK` when credentials were vended for the repo prefix.
+- `Access Grants: not available (using direct S3 credentials)` on an `AccessDenied`, naming the exact failing operation and the missing permission — e.g. `caller role is missing s3:GetAccessGrantsInstanceForPrefix` or `caller role is missing s3:GetDataAccess or has no matching grant`.
+
+This is informational: an IAM-key user with no grant legitimately reports "not available" and keeps working via direct credentials — that is expected, not an error.
 
 ## Notes about specific behaviors of Amazon S3 remotes
 
@@ -421,35 +461,13 @@ An Amazon S3 URI for a valid bucket and an arbitrary prefix which does not conta
 % git clone s3://my-git-bucket/this-is-a-new-repo
 Cloning into 'this-is-a-new-repo'...
 warning: You appear to have cloned an empty repository.
-% cd this-is-a-new-repo
-% git remote -v
-origin  s3://my-git-bucket/this-is-a-new-repo (fetch)
-origin  s3://my-git-bucket/this-is-a-new-repo (push)
 ```
 
 **Tip**: This behavior can be used to quickly create a new git repo.
 
-### Concurrency and locking
-
-`git-remote-s3` has no locks. Every ref in the repo — branch, tag, and HEAD — lives in a single object, `<prefix>/gitwal.json`, and every write to that repo is one conditional PUT against it: `If-None-Match: *` to create it, `If-Match: <etag>` to update it. S3 only accepts the PUT if the etag still matches what the client read, so two pushers racing each other cannot both win. The loser's PUT is rejected with a precondition failure, and `git-remote-s3` reloads the manifest, re-checks the push against the refs it now names (fast-forward, `--force`, `--force-with-lease`, protected-branch), and retries the whole decision from scratch. There is nothing to time out, nothing to expire, and nothing to clean up by hand.
-
-The objects a push uploads — packs under `<prefix>/packs/<sha>.pack`, LFS blobs under `<prefix>/lfs/<oid>` — are content-addressed and written before the manifest CAS, so they are immutable and safe to upload from multiple clients at once; the manifest PUT is the single serialization point that decides which pack(s) actually become part of a ref's history. A pack uploaded by a push that loses the race is simply never referenced by any entry and becomes an orphan, reclaimed the next time someone runs `git-s3 compact`. No data is lost and no ref is ever left pointing at more than one place.
-
-`git-s3 doctor <s3-uri>` audits a repo's manifest and packs (schema validation, missing packs, orphan packs, whether compaction is due) without writing anything.
-
-## Manage the Amazon S3 remote
-
-### Delete branches
-
-To remove remote branches that are not used anymore you can use the `git-s3 delete-branch <s3uri> <branch_name>` command. This is a refs-only change: a conditional PUT drops the branch from the manifest. The packs it uniquely referenced stay in the bucket until `git-s3 compact` reclaims them.
-
-### Protected branches
-
-To protect/unprotect a branch run `git s3 protect <remote> <branch-name>` respectively `git s3 unprotect <remote> <branch-name>`.
-
 ## Under the hood
 
-### How S3 remote work
+### How S3 remotes work
 
 A repo is one manifest object, `<prefix>/gitwal.json`, plus the packs it names under `<prefix>/packs/<sha>.pack`. The manifest is the sole authority for what a ref points to: it lists every branch and tag, the HEAD, the protected refs, and a log of entries, each naming a pack and the tips that pack makes reachable.
 
@@ -457,13 +475,77 @@ Listing refs (`git ls-remote`, the start of a clone or fetch) reads the manifest
 
 Pushing packs the new objects with `git pack-objects`, excluding whatever the manifest already has, uploads the pack to its content-addressed key, then commits with a single conditional PUT to `gitwal.json` (see [Concurrency and locking](#concurrency-and-locking)). The PUT is the only step that can fail on a race; the pack upload before it is inert until an entry in the manifest names it.
 
-Because entries accumulate with every push, the log slowly grows one pack per push and the same objects can end up duplicated across several packs. `git-s3 compact <remote>` collapses the whole log into a single base pack covering every current ref, then deletes the packs it superseded.
+Because entries accumulate with every push, the log slowly grows one pack per push and the same objects can end up duplicated across several packs. [`git-s3 compact <remote>`](#compact-the-remote) collapses the whole log into a single base pack covering every current ref, then deletes the packs it superseded. The same pass reclaims orphans — packs under `<prefix>/packs/` that no manifest entry has ever named, left by a push whose CAS lost or whose process died between the upload and the commit. Only orphans older than the grace period are collected, because a recently uploaded unreferenced pack may belong to a push that is still in flight. The referenced set is re-read from the manifest after the bucket is listed, and each pack's age is re-checked immediately before its delete, so a pack that becomes referenced mid-run is never collected.
 
-### How LFS work
+### Concurrency and locking
+
+`git-remote-s3` has no locks. Every ref in the repo — branch, tag, and HEAD — lives in a single object, `<prefix>/gitwal.json`, and every write to that repo is one conditional PUT against it: `If-None-Match: *` to create it, `If-Match: <etag>` to update it. S3 only accepts the PUT if the etag still matches what the client read, so two pushers racing each other cannot both win.
+
+The loser's PUT is rejected with a precondition failure, and `git-remote-s3` reloads the manifest, re-checks the push against the refs it now names (fast-forward, `--force`, `--force-with-lease`, protected-branch), and retries the whole decision from scratch. The retry loop is bounded (8 attempts, backoff capped at 2s); under sustained contention it gives up and fails the push with a clear error per ref. Nothing is left behind either way.
+
+The objects a push uploads — packs under `<prefix>/packs/<sha>.pack`, LFS blobs under `<prefix>/lfs/<oid>` — are content-addressed and written before the manifest CAS, so they are immutable and safe to upload from multiple clients at once; the manifest PUT is the single serialization point that decides which pack(s) actually become part of a ref's history.
+
+A pack uploaded by a push that loses the race is simply never referenced by any entry and becomes an orphan. Orphans are inert, and `git-s3 compact` reclaims them once they are older than its grace period (24h by default, `--prune-orphans-older-than`); the grace period is what keeps the sweep from deleting the pack of a push that has uploaded but not yet committed. No data is lost and no ref is ever left pointing at more than one place.
+
+### Bucket region cache
+
+Every S3 client the remote helper builds is pinned to the bucket's own region, detected via a `HeadBucket` probe (which returns the region even for an unauthorized caller, so it needs no extra permission and is cached per process). Doing that on every single git command would cost a round trip each time, so the first successful detection is written to the repo-local git config as `remote.<name>.s3region`, and every later invocation reads it from there instead:
+
+```bash
+git config --get remote.origin.s3region
+# eu-west-1
+```
+
+The value is written the first time any helper invocation builds an S3 client for a real remote name — not just clone, fetch or push, but also read-only commands like `git ls-remote` and `git remote show`. A push or fetch straight to a URI (`git push s3://bucket/repo ...`) detects the region and does not cache it, since there is no remote name to cache it under. For submodules the key lands in the submodule's own config under `.git/modules/<name>/config`.
+
+If a bucket ever moves to another region, the cached value goes stale. The helper notices the redirect S3 returns, drops the key and retries once, so the operation still succeeds; you can also clear it by hand:
+
+```bash
+git config --unset remote.origin.s3region
+```
+
+If the region cannot be determined at all, the tool proceeds with your default region and S3's cross-region redirects, exactly as before.
+
+### DNS alias resolution
+
+For a dotted bucket component, the TXT lookup expects:
+
+- A TXT record at the alias hostname itself.
+- Among its TXT values, exactly one of the form `git-bucket=<real-bucket-name>`; other TXT values at the same name are ignored.
+
+Aliases work in every place a remote URI is accepted: the git remote helper, the `git-lfs-s3` transfer agent and `git-lfs-s3 install --remote`, and the `git-s3` management CLI. Resolution results are cached for the lifetime of the process. If the alias has no TXT record or no `git-bucket=` value, the command fails with an error describing the expected record instead of falling back to using the hostname as a bucket name.
+
+Both `remote.<name>.s3-dns-alias` and `s3.dns-alias` are booleans; setting the per-remote key to `true` re-enables aliasing for that remote even when `s3.dns-alias` is `false`. The per-remote key applies where a remote name is available (the git remote helper, the LFS transfer agent, `git-lfs-s3 install --remote`). The `git-s3` CLI is invoked with a remote name too, but it resolves the bucket alias without passing that name along, so it only ever consults `s3.dns-alias`.
+
+### Imported-entry high-water mark
+
+`remote.<name>.gitwal-seq` records the highest `gitwal.json` entry seq imported into this clone, so a routine fetch downloads only the packs added since. It is a hint, never state: after importing, the client verifies the fetched tips with `git rev-list --objects` and, when they do not resolve, keeps pulling older entries until they do. A stale or hand-edited value costs a round trip, never correctness, and the key is written only after verification passes.
+
+```bash
+git config --get remote.origin.gitwal-seq
+# 43
+```
+
+As with the region cache, a fetch straight to a URI has no remote section to write to and re-imports from the start of the log.
+
+### Access Grants and IAM
+
+The Access Grants plugin is registered transparently and always runs with fallback enabled, so a single code path serves both credential models. The two IAM actions the vend path needs are:
+
+- `s3:GetDataAccess` — vends the scoped credentials.
+- `s3:GetAccessGrantsInstanceForPrefix` — resolves which account owns the Access Grants instance for the requested `s3://bucket/prefix`.
+
+The plugin calls `GetAccessGrantsInstanceForPrefix` **before** it can call `GetDataAccess`, because it must first learn the owner account id to target. This is a separate IAM action that is easy to overlook: if the caller has `s3:GetDataAccess` but not `s3:GetAccessGrantsInstanceForPrefix`, the plugin fails during that preflight and — because fallback is enabled — **silently** drops to direct S3 credentials. The user then sees only a misleading downstream `AccessDenied` from the direct call (or a successful direct call that never used Access Grants at all), with nothing pointing at the real cause. Grant both actions together.
+
+[`git-s3 doctor`](#git-s3-doctor) is the way out: its entitlement check disables fallback and drives the full vend path, including that preflight, so the real error surfaces.
+
+### How LFS works
 
 The LFS integration stores the file in the bucket defined by the remote URI, under a key `<prefix>/lfs/<oid>`, where oid is the unique identifier assigned by git-lfs to the file.
 
 If an object with the same key already exists, git-lfs-s3 does not upload it again.
+
+The auto-install that runs on first remote-helper invocation writes exactly the same per-remote keys as `git-lfs-s3 install --remote <name>` — `lfs.customtransfer.git-lfs-s3.path`, `remote.<name>.lfsurl` and the URL-scoped `lfs.<url>.standalonetransferagent` — and never the repo-wide `lfs.standalonetransferagent`. An existing `lfs.standalonetransferagent` naming another agent, or an existing `remote.<name>.lfsurl`, suppresses the install entirely, and nothing is written for a remote that is not an `s3://` URL — including a bucket-root remote with no prefix (`s3://my-git-bucket`), which has no repo-specific path to build an LFS URL from. `GIT_REMOTE_S3_AUTO_INSTALL_LFS=0` disables it.
 
 ### Debugging
 
@@ -481,7 +563,7 @@ GIT_REMOTE_S3_VERBOSE=1 git push origin main
 
 Logs will be put to stderr.
 
-For LFS operations you can enable and disable debug logging via `git-lfs-s3 enable-debug` and `git-lfs-s3 disable-debug` respectively. Logs are put in `.git/lfs/tmp/git-lfs-s3.log` in the repo.
+For LFS operations you can enable and disable debug logging via `git-lfs-s3 enable-debug` and `git-lfs-s3 disable-debug` respectively. Logs are put in `.git/lfs/tmp/git-lfs-s3.log` in the repo. For submodules the log lands under the superproject's `.git/modules/<name>/lfs/tmp/git-lfs-s3.log` instead, same as the region cache.
 
 ## Credits
 

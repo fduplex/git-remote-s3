@@ -11,8 +11,8 @@ import pytest
 
 from git_remote_s3 import lfs
 
-_FACADE_URL = "https://demos.git.fduplex.cloud/core/cli"
-_S3_URL = "s3://fdm-gb@demos.git.fduplex.cloud/core/cli"
+_FACADE_URL = "https://demos.git.example.com/core/cli"
+_S3_URL = "s3://myprofile@demos.git.example.com/core/cli"
 
 
 @pytest.fixture
@@ -46,19 +46,19 @@ def test_insteadof_rewrites_facade_url(isolated_git_config):
 
 
 def test_insteadof_longest_matching_prefix_wins(isolated_git_config):
-    _add_insteadof(isolated_git_config, "s3://bucket/", "https://demos.git.fduplex.cloud/")
+    _add_insteadof(isolated_git_config, "s3://bucket/", "https://demos.git.example.com/")
     _add_insteadof(isolated_git_config, _S3_URL, _FACADE_URL)
     _add_insteadof(isolated_git_config, "s3://other/", "https://")
 
     assert lfs._apply_url_insteadof(_FACADE_URL) == _S3_URL
-    assert lfs._apply_url_insteadof("https://demos.git.fduplex.cloud/core/other") == "s3://bucket/core/other"
+    assert lfs._apply_url_insteadof("https://demos.git.example.com/core/other") == "s3://bucket/core/other"
 
 
 def test_insteadof_supports_multiple_values_for_one_base(isolated_git_config):
     _add_insteadof(isolated_git_config, _S3_URL, _FACADE_URL)
-    _add_insteadof(isolated_git_config, _S3_URL, "ssh://git@demos.git.fduplex.cloud/core/cli")
+    _add_insteadof(isolated_git_config, _S3_URL, "ssh://git@demos.git.example.com/core/cli")
 
-    assert lfs._apply_url_insteadof("ssh://git@demos.git.fduplex.cloud/core/cli") == _S3_URL
+    assert lfs._apply_url_insteadof("ssh://git@demos.git.example.com/core/cli") == _S3_URL
 
 
 def test_insteadof_leaves_unmatched_url_untouched(isolated_git_config):
@@ -135,7 +135,7 @@ def test_init_with_invalid_remote_name_is_rejected(isolated_git_config):
 def test_init_with_facade_url_builds_a_working_process(isolated_git_config):
     """End to end through the real LFSProcess: bucket and prefix come out of the
     rewritten URL, the init ack goes out, and nothing reaches AWS."""
-    _add_insteadof(isolated_git_config, "s3://fdm-gb@bucket/core/cli", _FACADE_URL)
+    _add_insteadof(isolated_git_config, "s3://myprofile@bucket/core/cli", _FACADE_URL)
     stdin = StringIO(json.dumps({"event": "init", "operation": "download", "remote": _FACADE_URL}) + "\n")
     stdout = StringIO()
 
@@ -146,6 +146,6 @@ def test_init_with_facade_url_builds_a_working_process(isolated_git_config):
                     lfs.main()
 
     process = init.call_args.args[0]
-    assert (process.bucket, process.prefix, process.profile) == ("bucket", "core/cli", "fdm-gb")
+    assert (process.bucket, process.prefix, process.profile) == ("bucket", "core/cli", "myprofile")
     assert stdout.getvalue().strip() == "{}"
     session.assert_not_called()
