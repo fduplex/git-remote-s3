@@ -47,7 +47,7 @@ def pack_objects(
     """Packs everything reachable from sha and not from the shas the remote already holds.
 
     Not `--thin`: a delta base outside the pack would make the pack unindexable on its own, and
-    every reader of this format (the client, the materializer's dulwich reader) indexes each pack
+    every reader of this format (the client, any dulwich-based reader) indexes each pack
     standalone. Shas the local repo does not hold are dropped from the exclusion set rather than
     failing the push.
 

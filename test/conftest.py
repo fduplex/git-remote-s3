@@ -17,6 +17,29 @@ def pytest_configure(config):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_git_config(tmp_path_factory, monkeypatch):
+    """Scopes every test that shells out to git to a throwaway global config.
+
+    A developer machine that has actually run 'git-lfs-s3 install --global' carries
+    lfs.customtransfer.git-lfs-s3.path in ~/.gitconfig, so 'git config --get-all' returns the
+    installer's own local write *plus* the ambient one and the install tests see duplicates.
+    """
+    config = tmp_path_factory.mktemp("gitconfig") / "config"
+    config.write_text(
+        "[user]\n"
+        "\tname = Test\n"
+        "\temail = test@example.com\n"
+        "[init]\n"
+        "\tdefaultBranch = main\n"
+        '[protocol "s3"]\n'
+        "\tallow = always\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture
 def temp_git_repo(monkeypatch):
     """A throwaway git repo as cwd, with every env var the helper reads cleared.

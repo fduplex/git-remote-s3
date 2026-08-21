@@ -128,7 +128,9 @@ def test_stale_cached_region_is_dropped_and_the_call_retried(client_mock, config
 
     remote = _remote(remote_name="origin", remote_url=URL)
 
-    assert remote.list_refs().refs == {}
+    refs = remote.list_refs()
+    assert refs is not None
+    assert refs.refs == {}
     assert config_run.call_args_list[0].args == ("--local", "--unset", REGION_KEY)
     client_mock.assert_any_call("s3", region_name="eu-west-1")
 

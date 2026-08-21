@@ -130,7 +130,7 @@ def test_download_uses_resolved_gitdir_for_temp_dir(
         captured["Config"] = Config
 
     proc.s3_bucket.download_file = fake_download_file
-    proc.init_s3_bucket = lambda: None
+    proc.init_s3_bucket = lambda: None  # ty: ignore[invalid-assignment]
 
     with patch("sys.stdout"):
         proc.download({"event": "download", "oid": "abc123", "size": 1})
@@ -150,7 +150,7 @@ def _make_upload_proc(client):
     bucket.name = "test_bucket"
     bucket.meta.client = client
     proc.s3_bucket = bucket
-    proc.init_s3_bucket = lambda: None
+    proc.init_s3_bucket = lambda: None  # ty: ignore[invalid-assignment]
     return proc, bucket
 
 

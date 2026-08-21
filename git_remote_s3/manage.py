@@ -84,6 +84,31 @@ _PROTECTED_MARKER = "PROTECTED#"
 
 _ROLLBACK = "Rollback: delete gitwal.json and packs/ to roll back; legacy keys are untouched"
 
+DEFAULT_ORPHAN_GRACE = "24h"
+
+# Below this an orphan sweep can outrun a push that has uploaded its pack but not yet won the CAS,
+# so anything shorter has to be asked for twice.
+_ORPHAN_GRACE_FLOOR_S = 3600.0
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd])?")
+
+
+def parse_duration(text: str) -> float:
+    """Seconds from a ``<number><s|m|h|d>`` duration. A bare number is hours."""
+    match = _DURATION_RE.fullmatch(text.strip().lower())
+    if not match:
+        raise ValueError(f"{text!r} is not a duration; use forms like 24h, 90m, 7d")
+    return float(match.group(1)) * _DURATION_UNITS[match.group(2) or "h"]
+
+
+def _human_duration(seconds: float) -> str:
+    """Hours, never days: the default has to read back as the ``24h`` the operator was told."""
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds / size:.0f}{unit}"
+    return f"{seconds:.0f}s"
+
 
 @contextlib.contextmanager
 def _git_dir(path: str):
@@ -261,9 +286,9 @@ class Doctor(_Repo):
     def report_packs(self, manifest: gitwal.Manifest) -> int:
         """Diffs entries[].pack against the pack objects in S3. Returns the error count.
 
-        An orphan is inert by definition and is collected by ``git-s3 compact``, never here:
-        doctor deletes nothing. A missing pack is corruption, and it is the only finding in this
-        format that exits non-zero.
+        An orphan is inert by definition and is collected by ``git-s3 compact`` once it is past
+        that command's grace period, never here: doctor deletes nothing. A missing pack is
+        corruption, and it is the only finding in this format that exits non-zero.
         """
         stored = self.list_packs()
         named = {e.pack: e for e in manifest.entries}
@@ -275,7 +300,10 @@ class Doctor(_Repo):
         orphans = sorted(pack for pack in stored if pack not in named)
         reclaimable = sum(stored[pack] for pack in orphans)
         if orphans:
-            print(f" orphan packs: {len(orphans)} ({_human_bytes(reclaimable)} reclaimable by git-s3 compact)")
+            print(
+                f" orphan packs: {len(orphans)} ({_human_bytes(reclaimable)}, reclaimed by git-s3 compact "
+                f"once older than {DEFAULT_ORPHAN_GRACE})"
+            )
         else:
             print(" orphan packs: none")
         if len(manifest.entries) > 1:
@@ -291,7 +319,16 @@ class Compact(_Repo):
 
     The base pack is built from the operator's local clone, so the clone must hold every ref the
     manifest names -- a pack built from a partial clone would drop objects the manifest promises.
+
+    Compaction is also the repo's garbage collector. Beyond the packs it supersedes it reclaims
+    orphans: pack objects no entry has ever named, left behind by a push whose CAS lost or whose
+    process died between the upload and the commit. An orphan is indistinguishable from the pack of
+    a push that is still in flight, so only orphans older than ``orphan_grace_s`` are collected.
     """
+
+    def __init__(self, profile, bucket, prefix, orphan_grace_s: float | None = None) -> None:
+        super().__init__(profile, bucket, prefix)
+        self.orphan_grace_s = parse_duration(DEFAULT_ORPHAN_GRACE) if orphan_grace_s is None else orphan_grace_s
 
     def run(self) -> int:  # noqa: C901
         manifest, _etag = self.wal.load()
@@ -350,6 +387,13 @@ class Compact(_Repo):
         # crash before the deletes leaves orphans, which the format defines as harmless.
         superseded = gitwal.superseded_packs(replaced[-1], committed)
         deleted = self.delete_packs(superseded)
+        try:
+            orphans, held = self.find_orphans(collected=set(superseded))
+        except (ClientError, gitwal.ManifestError) as x:
+            # The compaction has already committed; a failed sweep only leaves the orphans in place.
+            print(f"could not sweep orphan packs: {x}")
+            orphans, held = [], 0
+        reclaimed = self.delete_packs(orphans)
 
         after_bytes = sum(e.bytes for e in committed.entries)
         print(
@@ -357,7 +401,48 @@ class Compact(_Repo):
             f"-> {len(committed.entries)} entry ({_human_bytes(after_bytes)}) at seq {committed.seq}"
         )
         print(f"Deleted {deleted} superseded pack{'' if deleted == 1 else 's'}")
+        print(f"Reclaimed {reclaimed} orphan pack{'' if reclaimed == 1 else 's'}")
+        if held:
+            print(
+                f"Kept {held} orphan pack{'' if held == 1 else 's'} newer than {_human_duration(self.orphan_grace_s)}"
+            )
         return 0
+
+    def find_orphans(self, *, collected: set[str]) -> tuple[list[str], int]:
+        """The reclaimable orphans and the count held back for being too new.
+
+        The order of the two reads is the safety property: packs are listed first and the manifest
+        is re-read after, so a pack that gains an entry between them is seen as referenced. A pack
+        uploaded after the listing is not a candidate at all.
+        """
+        stored = [pack for pack in self.list_packs() if pack not in collected]
+        manifest, _etag = self.wal.load()
+        if manifest is None:
+            return [], 0
+
+        referenced = {e.pack for e in manifest.entries}
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self.orphan_grace_s)
+        orphans: list[str] = []
+        held = 0
+        for pack in sorted(pack for pack in stored if pack not in referenced):
+            modified = self.last_modified(pack)
+            if modified is None or modified > cutoff:
+                held += 1
+            else:
+                orphans.append(pack)
+        return orphans, held
+
+    def last_modified(self, pack: str) -> datetime.datetime | None:
+        """The pack's age as S3 holds it right now, or None when it cannot be read.
+
+        Read here rather than taken from the listing: re-uploading an existing pack makes it young
+        again, and that upload is a push whose commit has not happened yet.
+        """
+        try:
+            return self.s3.head_object(Bucket=self.bucket, Key=self.key(pack))["LastModified"]
+        except ClientError as x:
+            print(f"could not stat {pack}: {x}")
+            return None
 
     def delete_packs(self, packs: list[str]) -> int:
         deleted = 0
@@ -541,8 +626,8 @@ class Migrate(_Repo):
 
     def report_migrated(self) -> None:
         print(f"\nMigrated {self.name}. Observe before finalizing:")
-        print("  - the materializer fires on the gitwal.json PUT: confirm this repo re-rendered")
-        print("  - the SPA lists this repo's branches at their expected tips")
+        print("  - any downstream consumers/watchers of gitwal.json see this repo migrated")
+        print("  - `git-s3 doctor <remote>` is clean")
         print("  - clone and push once through the new client")
         print("  - the legacy keys are still present; nothing has been deleted")
         print(f"\n{_ROLLBACK}")
@@ -678,6 +763,23 @@ class ManageBranch(_Repo):
         print(f"Branch {self.branch} is now unprotected")
 
 
+def _orphan_grace(args) -> float:
+    """The compact grace period in seconds. Exits rather than let a short one through unasked."""
+    try:
+        seconds = parse_duration(args.prune_orphans_older_than)
+    except ValueError as x:
+        sys.stderr.write(f"fatal: --prune-orphans-older-than {x}\n")
+        sys.exit(1)
+    if seconds < _ORPHAN_GRACE_FLOOR_S and not args.yes:
+        sys.stderr.write(
+            f"fatal: --prune-orphans-older-than {args.prune_orphans_older_than} is under "
+            f"{_human_duration(_ORPHAN_GRACE_FLOOR_S)}, which can delete the pack of a push that has "
+            f"uploaded but not yet committed; re-run with --yes to accept that\n"
+        )
+        sys.exit(1)
+    return seconds
+
+
 def main():  # noqa: C901
     parser = argparse.ArgumentParser()
     parser.add_argument("command")
@@ -690,7 +792,18 @@ def main():  # noqa: C901
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="migrate --finalize: confirm the deletion, which cannot be undone",
+        help="confirm a deletion that cannot be undone: migrate --finalize, or a short compact grace period",
+    )
+    parser.add_argument(
+        "--prune-orphans-older-than",
+        metavar="DURATION",
+        default=DEFAULT_ORPHAN_GRACE,
+        help=(
+            f"compact: reclaim unreferenced packs older than this (24h, 90m, 7d; a bare number is hours; "
+            f"default {DEFAULT_ORPHAN_GRACE}). Anything under "
+            f"{_human_duration(_ORPHAN_GRACE_FLOOR_S)} needs --yes: it can delete the pack of a push that "
+            f"has uploaded but not yet committed"
+        ),
     )
     # Optional: "doctor" and "compact" don't take a branch; delete-branch/protect/unprotect
     # validate it's present themselves (see the args.branch is None check below), and "head"
@@ -722,7 +835,7 @@ def main():  # noqa: C901
         if args.command == "doctor":
             sys.exit(Doctor(profile, bucket, prefix).run())
         if args.command == "compact":
-            sys.exit(Compact(profile, bucket, prefix).run())
+            sys.exit(Compact(profile, bucket, prefix, orphan_grace_s=_orphan_grace(args)).run())
         if args.command == "migrate":
             sys.exit(Migrate(profile, bucket, prefix, args.finalize, args.yes).run())
         if args.command == "head":

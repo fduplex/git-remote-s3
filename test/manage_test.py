@@ -11,8 +11,8 @@ from unittest.mock import patch, MagicMock
 from botocore.exceptions import ClientError
 
 from git_remote_s3 import UriScheme, git, gitwal
-from git_remote_s3.manage import Compact, Doctor, ManageBranch, ManageHead, main
-from remote_test import ManifestStore, _clone, _git, _make_origin, wal_manifest
+from git_remote_s3.manage import Compact, Doctor, ManageBranch, ManageHead, main, parse_duration
+from remote_test import ManifestStore, _clone, _git, _make_origin, client_error, wal_manifest
 
 
 @pytest.fixture
@@ -67,8 +67,80 @@ def test_compact_is_wired_to_the_remote(mocked_cli_chain, monkeypatch):
         main()
 
     assert excinfo.value.code == 0
-    compact_cls.assert_called_once_with("profile", "bucket", "repo")
+    compact_cls.assert_called_once_with("profile", "bucket", "repo", orphan_grace_s=24 * 3600)
     compact_cls.return_value.run.assert_called_once_with()
+
+
+def test_compact_takes_a_custom_orphan_grace_period(mocked_cli_chain, monkeypatch):
+    _, _, compact_cls = mocked_cli_chain
+    monkeypatch.setattr(
+        "sys.argv",
+        ["git-s3", "compact", "--prune-orphans-older-than", "7d", "s3://profile@bucket/repo"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    compact_cls.assert_called_once_with("profile", "bucket", "repo", orphan_grace_s=7 * 24 * 3600)
+
+
+def test_compact_refuses_a_grace_period_short_enough_to_race_a_push(mocked_cli_chain, monkeypatch, capsys):
+    _, _, compact_cls = mocked_cli_chain
+    monkeypatch.setattr(
+        "sys.argv",
+        ["git-s3", "compact", "--prune-orphans-older-than", "0", "s3://profile@bucket/repo"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+    assert "uploaded but not yet committed" in capsys.readouterr().err
+    compact_cls.assert_not_called()
+
+
+def test_compact_accepts_a_short_grace_period_with_yes(mocked_cli_chain, monkeypatch):
+    _, _, compact_cls = mocked_cli_chain
+    monkeypatch.setattr(
+        "sys.argv",
+        ["git-s3", "compact", "--prune-orphans-older-than", "0", "--yes", "s3://profile@bucket/repo"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    compact_cls.assert_called_once_with("profile", "bucket", "repo", orphan_grace_s=0)
+
+
+def test_compact_rejects_a_grace_period_that_is_not_a_duration(mocked_cli_chain, monkeypatch, capsys):
+    _, _, compact_cls = mocked_cli_chain
+    monkeypatch.setattr(
+        "sys.argv",
+        ["git-s3", "compact", "--prune-orphans-older-than", "soon", "s3://profile@bucket/repo"],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+    assert "is not a duration" in capsys.readouterr().err
+    compact_cls.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "text,seconds",
+    [("24h", 86400), ("90m", 5400), ("7d", 604800), ("30s", 30), ("0", 0), ("1.5h", 5400), (" 12H ", 43200)],
+)
+def test_parse_duration_reads_the_documented_forms(text, seconds):
+    assert parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["", "soon", "24hours", "-1h", "h", "24 h 30m"])
+def test_parse_duration_refuses_anything_else(text):
+    with pytest.raises(ValueError):
+        parse_duration(text)
 
 
 def test_delete_branch_without_branch_still_errors(mocked_cli_chain, monkeypatch, capsys):
@@ -242,7 +314,7 @@ def test_doctor_counts_orphan_packs_and_their_bytes(capsys):
     out = capsys.readouterr().out
     # Orphans are inert: reported, never deleted, and never a non-zero exit.
     assert code == 0
-    assert "orphan packs: 2 (3.0 KiB reclaimable by git-s3 compact)" in out
+    assert "orphan packs: 2 (3.0 KiB, reclaimed by git-s3 compact once older than 24h)" in out
     store.client.delete_object.assert_not_called()
 
 
@@ -272,13 +344,52 @@ PREFIX = "repo"
 CALLER_ARN = "arn:aws:sts::000000000000:assumed-role/git-buckets-dev/tester"
 
 
-def _compact(manifest, tmp_path, put_results=()):
+def _ago(**kwargs):
+    return datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(**kwargs)
+
+
+class _Bucket:
+    """The packs/ half of a stubbed client: a listing, a head_object, and whatever gets uploaded.
+
+    ``ages`` maps a repo-relative pack key to its LastModified. ``head_ages`` overrides what
+    head_object reports for a key, standing in for a pack re-uploaded after the listing was taken.
+    """
+
+    def __init__(self, client, prefix, ages=None, head_ages=None, on_list=None):
+        self.objects = {f"{prefix}/{pack}": stamp for pack, stamp in (ages or {}).items()}
+        self.heads = {f"{prefix}/{pack}": stamp for pack, stamp in (head_ages or {}).items()}
+        self.on_list = on_list
+        client.list_objects_v2.side_effect = self._list
+        client.head_object.side_effect = self._head
+
+    def _list(self, **kwargs):
+        contents = [
+            {"Key": key, "Size": 1024, "LastModified": stamp}
+            for key, stamp in sorted(self.objects.items())
+            if key.startswith(kwargs["Prefix"])
+        ]
+        if self.on_list is not None:
+            self.on_list()
+        return {"Contents": contents}
+
+    def _head(self, Bucket, Key):
+        if Key not in self.objects:
+            raise client_error("NotFound")
+        return {"LastModified": self.heads.get(Key, self.objects[Key]), "ContentLength": 1024}
+
+    def uploaded(self, key, stamp=None):
+        self.objects[key] = stamp or datetime.datetime.now(tz=datetime.timezone.utc)
+
+
+def _compact(manifest, tmp_path, put_results=(), ages=None, head_ages=None, on_list=None, orphan_grace_s=None):
     """A Compact over a stubbed client; uploaded packs are copied where the test can index them."""
     client = MagicMock()
     saved = tmp_path / "uploaded.pack"
+    bucket = _Bucket(client, PREFIX, ages, head_ages, on_list)
 
     def upload_file(Filename, Bucket, Key, **kwargs):
         shutil.copy(Filename, saved)
+        bucket.uploaded(Key)
 
     client.upload_file.side_effect = upload_file
     with (
@@ -289,7 +400,7 @@ def _compact(manifest, tmp_path, put_results=()):
     ):
         session_cls.return_value.client.return_value.get_caller_identity.return_value = {"Arn": CALLER_ARN}
         store = ManifestStore(client, manifest=manifest, put_results=put_results, key=f"{PREFIX}/gitwal.json")
-        return Compact(None, "bucket", PREFIX), store, saved
+        return Compact(None, "bucket", PREFIX, orphan_grace_s=orphan_grace_s), store, saved
 
 
 def _local_repo(tmp_path, monkeypatch):
@@ -371,6 +482,90 @@ def test_compact_deletes_superseded_packs_only_after_the_cas(tmp_path, monkeypat
     names = [call[0] for call in store.client.mock_calls if call[0] in ("put_object", "delete_object")]
     # Order is the safety property: until the manifest commits, those packs are still live.
     assert names == ["put_object", *["delete_object"] * len(packs)]
+
+
+ORPHAN = "packs/" + "e" * 40 + ".pack"
+
+
+def _deleted_keys(store):
+    return [call.kwargs["Key"] for call in store.client.delete_object.call_args_list]
+
+
+def test_compact_reclaims_an_orphan_older_than_the_grace_period(tmp_path, monkeypatch, capsys):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    manifest, packs = _log_of(refs)
+    ages = {pack: _ago(days=30) for pack in packs}
+    ages[ORPHAN] = _ago(days=3)
+    compact, store, _uploaded = _compact(manifest, tmp_path, ages=ages)
+
+    assert compact.run() == 0
+
+    # Superseded first, orphan after, and the superseded packs are not deleted twice.
+    assert _deleted_keys(store) == [f"{PREFIX}/{pack}" for pack in [*packs, ORPHAN]]
+    assert "Reclaimed 1 orphan pack" in capsys.readouterr().out
+
+
+def test_compact_keeps_an_orphan_younger_than_the_grace_period(tmp_path, monkeypatch, capsys):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    manifest, packs = _log_of(refs)
+    compact, store, _uploaded = _compact(manifest, tmp_path, ages={ORPHAN: _ago(hours=2)})
+
+    assert compact.run() == 0
+
+    assert _deleted_keys(store) == [f"{PREFIX}/{pack}" for pack in packs]
+    out = capsys.readouterr().out
+    assert "Reclaimed 0 orphan packs" in out
+    assert "Kept 1 orphan pack newer than 24h" in out
+
+
+def test_compact_keeps_an_orphan_the_listing_called_old_but_s3_now_reports_young(tmp_path, monkeypatch):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    manifest, packs = _log_of(refs)
+    # A push re-uploading the identical pack makes it young again between the listing and the delete.
+    compact, store, _uploaded = _compact(
+        manifest,
+        tmp_path,
+        ages={ORPHAN: _ago(days=3)},
+        head_ages={ORPHAN: _ago(seconds=5)},
+    )
+
+    assert compact.run() == 0
+
+    assert _deleted_keys(store) == [f"{PREFIX}/{pack}" for pack in packs]
+
+
+def test_compact_never_reclaims_a_pack_an_entry_names(tmp_path, monkeypatch):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    manifest, packs = _log_of(refs)
+    # Grace 0 removes the age guard, leaving only the referenced check to save the new base pack.
+    compact, store, _uploaded = _compact(manifest, tmp_path, ages={ORPHAN: _ago(days=3)}, orphan_grace_s=0)
+
+    assert compact.run() == 0
+
+    base = store.manifest.entries[0].pack
+    deleted = _deleted_keys(store)
+    assert f"{PREFIX}/{base}" not in deleted
+    assert deleted == [f"{PREFIX}/{pack}" for pack in [*packs, ORPHAN]]
+
+
+def test_compact_never_reclaims_a_pack_that_gains_an_entry_after_the_listing(tmp_path, monkeypatch):
+    _work, refs = _local_repo(tmp_path, monkeypatch)
+    manifest, packs = _log_of(refs)
+    holder: dict = {}
+
+    def on_list():
+        """A competing push commits an entry naming the orphan, after packs/ has been listed."""
+        holder["store"].hold(
+            wal_manifest(refs, head="refs/heads/main", entries=[_entry(99, ORPHAN, tips=refs)], seq=99)
+        )
+
+    compact, store, _uploaded = _compact(manifest, tmp_path, ages={ORPHAN: _ago(days=3)}, on_list=on_list)
+    holder["store"] = store
+
+    assert compact.run() == 0
+
+    # The referenced set is read after the listing, so the pack is seen as live and survives.
+    assert _deleted_keys(store) == [f"{PREFIX}/{pack}" for pack in packs]
 
 
 def test_compact_leaves_orphans_and_a_valid_manifest_when_it_dies_before_the_deletes(tmp_path, monkeypatch):

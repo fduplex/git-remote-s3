@@ -396,6 +396,7 @@ class ManifestStore:
 
     @property
     def manifest(self):
+        assert self.doc is not None
         return gitwal.load(self.doc)
 
 
@@ -1398,6 +1399,7 @@ def test_pack_objects_never_makes_git_rename_across_devices(tmp_path, monkeypatc
 
     def fake_run(args, input=None, stdout=None, stderr=None, **kwargs):
         calls.append(args)
+        assert stdout is not None
         stdout.write(EMPTY_PACK)
         return subprocess.CompletedProcess(args, 0, None, b"")
 
