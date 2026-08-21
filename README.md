@@ -11,7 +11,25 @@ LFS managed files to the same S3 bucket used as remote.
 This is a fork of [awslabs/git-remote-s3](https://github.com/awslabs/git-remote-s3), licensed under the
 Apache License 2.0 (unchanged). Not affiliated with or endorsed by Amazon Web Services.
 
-What this fork adds on top of upstream:
+The headline change is a rewritten storage backend (0.6): upstream's per-ref bundle files and lock objects are
+replaced by a single `gitwal.json` manifest updated with S3 conditional writes (compare-and-swap on the ETag),
+plus content-addressed incremental packs. That one design change is what unlocks most of the fork's behavior:
+
+- Lock-free concurrency: no lock objects to acquire, leak, or clean up by hand. Two racing pushes can't both
+  win; the loser reloads the manifest, re-checks, and retries. See
+  [Concurrency and locking](#concurrency-and-locking).
+- Atomic pushes: all refs in a push land in one conditional PUT, so the remote never shows a half-applied push.
+- `--force-with-lease` with real compare-and-swap semantics against the remote ref, not just a `+` force push.
+- Incremental packs: each push uploads only the new objects, and `git-s3 compact` collapses the log back into a
+  single base pack and reclaims unreferenced packs. See [How S3 remotes work](#how-s3-remotes-work).
+- Pre-0.6 repos are brought forward with [`git-s3 migrate`](#migrate-a-legacy-repo).
+
+The storage format is not compatible with upstream: an upstream client only recognizes `refs/**/*.bundle` keys, and
+a gitwal-format repo writes none, so upstream sees it as empty. This fork's client only reads `gitwal.json`, so a
+legacy bundle-format repo looks empty to it too, until [`git-s3 migrate`](#migrate-a-legacy-repo) writes the
+manifest.
+
+On top of that:
 
 - LFS fixes: per-remote scoping so an S3 LFS remote can coexist with non-S3 ones, auto-install of the transfer agent
   on first remote-helper run, correct temp-file paths when the repo is a submodule, and no ~10s stall per push on
@@ -23,7 +41,6 @@ What this fork adds on top of upstream:
 - Pushing from a shallow clone is rejected with a clear error instead of silently uploading a truncated pack
 - Partial clones (`git clone --filter=blob:none` / `--filter=tree:0`) are fully supported for push and fetch
 - Push and fetch render live transfer progress, honoring `git push --quiet` / `--progress`
-- `--force-with-lease` with real compare-and-swap semantics against the remote ref, not just a `+` force push
 
 ## Table of Contents
 
