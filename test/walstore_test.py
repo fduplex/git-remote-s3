@@ -72,6 +72,7 @@ class FakeS3:
         return {"ETag": self.etag}
 
     def stored(self):
+        assert self.doc is not None
         return json.loads(self.doc)
 
 
@@ -88,16 +89,21 @@ def manifest_with(**refs):
     return gitwal.Manifest(seq=7, head="refs/heads/main", refs=dict(refs))
 
 
-def push(ref, sha):
+class _RecordingMutator:
     """A mutator that records the state it saw, so a retry's re-run can be asserted on."""
-    seen = []
 
-    def mutate(manifest):
-        seen.append(manifest.copy())
-        return gitwal.apply_push(manifest, refs={ref: sha})
+    def __init__(self, ref, sha):
+        self.ref = ref
+        self.sha = sha
+        self.seen = []
 
-    mutate.seen = seen
-    return mutate
+    def __call__(self, manifest):
+        self.seen.append(manifest.copy())
+        return gitwal.apply_push(manifest, refs={self.ref: self.sha})
+
+
+def push(ref, sha):
+    return _RecordingMutator(ref, sha)
 
 
 def test_load_returns_none_when_the_repo_does_not_exist():
